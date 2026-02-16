@@ -5,7 +5,7 @@ You can expanding on the agent/graph.py file to insert additional structure and 
 
 It provides a lightweight FastAPI application that acts as a passthrough proxy for OpenAI‑compatible chat models. It supports multiple back‑end providers (OpenAI, OpenRouter, Azure OpenAI, LM Studio, and Ollama) and allows you to map alias model names to provider-specific model identifiers. Streaming responses are forwarded as Server‑Sent Events.
 
-In short, it allows you to inject additional capability to your model at inference time. You feed and OpenAI API endpoint in, passes the model inferece output through additional scafolding (default langchain/langgraph processing) and outputs the same OpenAI API which you can pass to your application.
+In short, it allows you to inject additional capability to your model at inference time. You feed and OpenAI API endpoint in, passes the model inferece output through additional scaffolding (default langchain/langgraph processing) and outputs the same OpenAI API which you can pass to your application.
 
 ## Features
 - **Multi‑provider support** – Configure any of the supported AI providers via environment variables.
