@@ -1,6 +1,11 @@
-# Project-2501
+# Experimental base
 
-Project-2501 is a lightweight FastAPI application that acts as a passthrough proxy for OpenAI‑compatible chat models. It supports multiple back‑end providers (OpenAI, OpenRouter, Azure OpenAI, LM Studio, and Ollama) and allows you to map alias model names to provider-specific model identifiers. Streaming responses are forwarded as Server‑Sent Events.
+The point of this project is to server as an experimental base.
+You can expanding on the agent/graph.py file to insert additional structure and capabilities to your AI model before you forward it to your application.
+
+It provides a lightweight FastAPI application that acts as a passthrough proxy for OpenAI‑compatible chat models. It supports multiple back‑end providers (OpenAI, OpenRouter, Azure OpenAI, LM Studio, and Ollama) and allows you to map alias model names to provider-specific model identifiers. Streaming responses are forwarded as Server‑Sent Events.
+
+In short, it allows you to inject additional capability to your model at inference time. You feed and OpenAi api endpoint in, passes the model inferece output through additional scafolding (default langchain/langgraph processing) and outputs the same OpenAi api that you can pass to your application.
 
 ## Features
 - **Multi‑provider support** – Configure any of the supported AI providers via environment variables.
