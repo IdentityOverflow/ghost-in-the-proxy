@@ -29,7 +29,30 @@ class Settings(BaseModel):
     lmstudio_base_url: str | None = os.getenv("LMSTUDIO_BASE_URL")
     ollama_base_url: str | None = os.getenv("OLLAMA_BASE_URL")
 
+    # When set, replaces the client's system prompt for every request.
+    # Unset (default) = faithful passthrough of the client's own prompt.
+    system_prompt_override: str | None = os.getenv("SYSTEM_PROMPT_OVERRIDE")
+
 
 settings = Settings()
 
-print("Loaded config:", settings.dict())
+# Boot summary without secrets: never print API keys.
+print(
+    "Loaded config:",
+    {
+        "default_provider": settings.default_provider,
+        "model_map": settings.model_map,
+        "providers_configured": [
+            name
+            for name, url in {
+                "openai": settings.openai_base_url,
+                "openrouter": settings.openrouter_base_url,
+                "azure": settings.azure_openai_base_url,
+                "lmstudio": settings.lmstudio_base_url,
+                "ollama": settings.ollama_base_url,
+            }.items()
+            if url
+        ],
+        "system_prompt_override": bool(settings.system_prompt_override),
+    },
+)

@@ -2,16 +2,13 @@
 import asyncio
 from typing import AsyncIterator
 
+import httpx
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..schemas import ChatCompletionRequest
 from ..routing.router import resolve_provider_and_model
-from ..agent.graph import (
-    agent_graph,
-    convert_to_langchain_messages,
-    convert_to_openai_messages
-)
+from ..agent.graph import agent_graph
 
 
 async def chat_completions(req: ChatCompletionRequest, request: Request):
@@ -20,22 +17,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     if not provider:
         raise HTTPException(400, f"No provider for model '{req.model}'")
 
-    # Convert messages to LangChain format
-    messages_dict = [msg.model_dump() for msg in req.messages]
-    langchain_messages = convert_to_langchain_messages(messages_dict)
+    # Raw OpenAI-format dicts in and out of the agent graph; exclude_none so
+    # optional fields we defaulted (e.g. content on tool-call messages) are
+    # omitted rather than sent as explicit nulls.
+    messages_dict = [msg.model_dump(exclude_none=True) for msg in req.messages]
+    agent_state = agent_graph.invoke({"messages": messages_dict})
 
-    # Process messages through LangGraph agent
-    agent_state = agent_graph.invoke({
-        "messages": langchain_messages,
-        "system_prompt": ""  # Empty string will trigger DEFAULT_SYSTEM_PROMPT via `or`
-    })
-
-    # Convert back to OpenAI format
-    modified_messages = convert_to_openai_messages(agent_state["messages"])
-
-    # Use the modified messages from the agent
     payload = req.model_dump(exclude_none=True)
-    payload["messages"] = modified_messages
+    payload["messages"] = agent_state["messages"]
     if target_model:
         payload["model"] = target_model
 
@@ -52,5 +41,17 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 raise
         return StreamingResponse(sse(), media_type="text/event-stream")
 
-    resp = await provider.chat_completions(payload)
+    try:
+        resp = await provider.chat_completions(payload)
+    except httpx.HTTPStatusError as error:
+        # Mirror backend errors (status + body) instead of collapsing them
+        # into an opaque proxy 500; clients rely on e.g. context-length 400s.
+        return JSONResponse(status_code=error.response.status_code, content=_error_body(error))
     return JSONResponse(resp)
+
+
+def _error_body(error: httpx.HTTPStatusError):
+    try:
+        return error.response.json()
+    except ValueError:
+        return {"error": error.response.text[:2000]}

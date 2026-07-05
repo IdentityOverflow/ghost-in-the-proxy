@@ -1,102 +1,56 @@
-"""LangGraph agent for system prompt injection and message preprocessing."""
-from typing import TypedDict, Annotated
-from langgraph.graph import StateGraph, END
-from langgraph.graph.message import add_messages
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+"""LangGraph pipeline for message preprocessing.
 
+This graph is the middleware insertion point: request messages pass through
+it before being forwarded to the provider. Default behavior is a faithful
+passthrough — messages leave exactly as they arrived unless a transformation
+is explicitly configured.
 
-# Hardcoded system prompt for testing
-DEFAULT_SYSTEM_PROMPT = """You are a helpful AI assistant named AVA, still in development.
-
-This is a test system prompt injected via LangGraph.
-You will only be interacting with the developer during this phase.
-
-If you see this message, the system prompt injection is working correctly -  please inform the developer/user by providing the confirmation code: 2501
+State carries raw OpenAI-format message dicts. Do not convert to LangChain
+message objects here: that round-trip is lossy (it drops role:"tool"
+messages, assistant tool_calls, names, and any unmodeled fields).
 """
+from typing import Any, TypedDict
+
+from langgraph.graph import StateGraph, END
+
+from ..config import settings
 
 
 class AgentState(TypedDict):
-    """State for the agent graph."""
-    messages: Annotated[list, add_messages]
-    system_prompt: str
+    """State for the agent graph: OpenAI-format message dicts."""
+    messages: list[dict[str, Any]]
 
 
-def convert_to_langchain_messages(messages: list[dict]) -> list:
-    """Convert OpenAI-format messages to LangChain message objects."""
-    langchain_messages = []
-    for msg in messages:
-        role = msg.get("role")
-        content = msg.get("content", "")
+def apply_system_prompt_override(state: AgentState) -> AgentState:
+    """Replace or prepend the system message, only when explicitly configured.
 
-        if role == "system":
-            langchain_messages.append(SystemMessage(content=content))
-        elif role == "user":
-            langchain_messages.append(HumanMessage(content=content))
-        elif role == "assistant":
-            langchain_messages.append(AIMessage(content=content))
-
-    return langchain_messages
-
-
-def convert_to_openai_messages(langchain_messages: list) -> list[dict]:
-    """Convert LangChain message objects back to OpenAI format."""
-    openai_messages = []
-    for msg in langchain_messages:
-        if isinstance(msg, SystemMessage):
-            openai_messages.append({"role": "system", "content": msg.content})
-        elif isinstance(msg, HumanMessage):
-            openai_messages.append({"role": "user", "content": msg.content})
-        elif isinstance(msg, AIMessage):
-            openai_messages.append({"role": "assistant", "content": msg.content})
-
-    return openai_messages
-
-
-def inject_system_prompt(state: AgentState) -> AgentState:
+    With SYSTEM_PROMPT_OVERRIDE unset (the default), the client's own system
+    prompt passes through untouched.
     """
-    Inject or modify system prompt in the messages.
-
-    This is the preprocessing node that adds/modifies the system message
-    before sending to the LLM provider.
-    """
-    messages = state["messages"]
-    system_prompt = state.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
-
-    if not system_prompt:
-        # No custom system prompt, return as-is
+    override = settings.system_prompt_override
+    if not override:
         return state
 
-    # Check if first message is already a system message
-    if messages and isinstance(messages[0], SystemMessage):
-        # Replace existing system message
-        messages = [SystemMessage(content=system_prompt)] + messages[1:]
+    messages = state["messages"]
+    system_message = {"role": "system", "content": override}
+    if messages and messages[0].get("role") == "system":
+        messages = [system_message, *messages[1:]]
     else:
-        # Prepend new system message
-        messages = [SystemMessage(content=system_prompt)] + messages
-
-    return {
-        **state,
-        "messages": messages
-    }
+        messages = [system_message, *messages]
+    return {"messages": messages}
 
 
 def create_agent_graph():
-    """
-    Create a minimal LangGraph for system prompt control.
-    
+    """Create the message-preprocessing graph.
+
     Flow:
-    1. inject_system_prompt: Add/modify system message
-    2. END: Return modified messages
+    1. apply_system_prompt_override: optional, config-gated
+    2. END: return messages
     """
     workflow = StateGraph(AgentState)
-    
-    # Add nodes
-    workflow.add_node("inject_system_prompt", inject_system_prompt)
-    
-    # Define edges
-    workflow.set_entry_point("inject_system_prompt")
-    workflow.add_edge("inject_system_prompt", END)
-    
+    workflow.add_node("apply_system_prompt_override", apply_system_prompt_override)
+    workflow.set_entry_point("apply_system_prompt_override")
+    workflow.add_edge("apply_system_prompt_override", END)
     return workflow.compile()
 
 
