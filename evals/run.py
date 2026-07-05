@@ -41,6 +41,13 @@ def parse_args() -> argparse.Namespace:
         help="harness-enforced context wall in tokens: abort a scenario when prompt_tokens "
         "exceeds this or the backend silently truncates (reported load drops)",
     )
+    parser.add_argument(
+        "--wall-mode",
+        choices=["strict", "exceed"],
+        default="strict",
+        help="strict: also abort when reported load drops (baseline truncation signature); "
+        "exceed: only abort past the wall — required for middleware runs, which shrink context",
+    )
     parser.add_argument("--judge-model", default=None)
     parser.add_argument("--judge-base-url", default=None, help="defaults to --base-url")
     parser.add_argument(
@@ -90,7 +97,11 @@ async def main() -> None:
         try:
             for scenario in scenarios:
                 print(f"\n=== {scenario.id}: {scenario.title} ({len(scenario.turns)} turns) ===", flush=True)
-                results.append(await run_scenario(scenario, client, judge=judge, wall=args.wall))
+                results.append(
+                    await run_scenario(
+                        scenario, client, judge=judge, wall=args.wall, wall_mode=args.wall_mode
+                    )
+                )
         finally:
             if judge is not None:
                 await judge.__aexit__(None, None, None)
@@ -101,6 +112,7 @@ async def main() -> None:
         "judge_model": judge.model if judge else None,
         "temperature": args.temperature,
         "wall": args.wall,
+        "wall_mode": args.wall_mode,
         "note": args.note,
         "date": datetime.now().isoformat(timespec="seconds"),
     }

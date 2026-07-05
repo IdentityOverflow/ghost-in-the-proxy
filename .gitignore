@@ -207,3 +207,4 @@ marimo/_lsp/
 __marimo__/
 evals/results/
 __pycache__/
+var/

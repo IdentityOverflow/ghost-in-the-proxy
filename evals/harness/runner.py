@@ -110,6 +110,7 @@ async def run_scenario(
     judge: JudgeClient | None = None,
     log: bool = True,
     wall: int | None = None,
+    wall_mode: str = "strict",
 ) -> ScenarioResult:
     messages: list[dict[str, Any]] = []
     if scenario.system_prompt:
@@ -135,8 +136,12 @@ async def run_scenario(
         # A growing transcript must report a growing prompt load. A drop means
         # the backend silently truncated: the true size exceeded its window,
         # so under honest stop-at-limit semantics this turn would have failed.
-        truncation_detected = not isinstance(client, MockClient) and (
-            record.prompt_tokens < previous_load
+        # wall_mode "exceed" disables this heuristic — REQUIRED for middleware
+        # runs, where the system under test legitimately shrinks the context.
+        truncation_detected = (
+            wall_mode == "strict"
+            and not isinstance(client, MockClient)
+            and record.prompt_tokens < previous_load
         )
         if wall is not None and (record.prompt_tokens > wall or truncation_detected):
             aborted_at = index
