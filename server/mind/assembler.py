@@ -17,9 +17,50 @@ from .store import Event
 MIND_HEADER = (
     "## Conversation memory\n"
     "You have a persistent memory of this conversation. Earlier turns are "
-    "condensed below; recent turns follow verbatim. Treat the summary as "
-    "true history you remember."
+    "condensed below; recent turns follow verbatim. Treat these records as "
+    "true history you remember. When asked about open items, commitments, "
+    "or decisions, answer from these records plus the recent turns — do not "
+    "invent additional items, and never present a 'leaning' as decided."
 )
+
+
+def render_memory(
+    summary_text: str,
+    records: dict[str, list[dict[str, Any]]],
+    episodes: list[tuple[int, int, str]],
+) -> str:
+    """Render the structured ledger + episodes (+ prose fallback) as the
+    memory section of the system prompt. Empty sections are omitted."""
+    sections: list[str] = []
+    decisions = records.get("decision", [])
+    if decisions:
+        lines = []
+        for item in decisions:
+            status = str(item.get("status", "open")).upper()
+            reason = f" (reason: {item['reason']})" if item.get("reason") else ""
+            lines.append(f"- {item.get('topic')}: {status} — {item.get('choice', '')}{reason}")
+        sections.append("### Decisions\n" + "\n".join(lines))
+    commitments = records.get("commitment", [])
+    open_commitments = [c for c in commitments if c.get("status", "open") == "open"]
+    if open_commitments:
+        lines = [
+            f"- ({item.get('actor', 'user')}) {item.get('statement')}"
+            + (f" — trigger: {item['trigger']}" if item.get("trigger") else "")
+            for item in open_commitments
+        ]
+        sections.append("### Open commitments (complete list of tracked items)\n" + "\n".join(lines))
+    facts = records.get("fact", [])
+    if facts:
+        lines = [f"- {item.get('subject')}: {item.get('claim')}" for item in facts]
+        sections.append("### Facts\n" + "\n".join(lines))
+    if episodes:
+        lines = [f"- {summary}" for _, _, summary in episodes]
+        sections.append("### Earlier events\n" + "\n".join(lines))
+    if summary_text:
+        sections.append("### Earlier conversation (condensed)\n" + summary_text)
+    if not sections:
+        return ""
+    return MIND_HEADER + "\n\n" + "\n\n".join(sections)
 
 
 def estimate_tokens(payload: Any) -> int:
@@ -57,6 +98,8 @@ def assemble(
     client_system: str | None,
     events: list[Event],
     summary: tuple[int, str] | None,
+    records: dict[str, list[dict[str, Any]]] | None = None,
+    episodes: list[tuple[int, int, str]] | None = None,
 ) -> Workspace:
     reserve = max(int(config.window * config.reserve_fraction), 1024)
     # chars/4 underestimates real tokenizers by ~20% (measured against
@@ -67,8 +110,9 @@ def assemble(
     if client_system:
         system_parts.append(client_system)
     summary_upto, summary_text = (summary or (0, ""))
-    if summary_text:
-        system_parts.append(f"{MIND_HEADER}\n\n{summary_text}")
+    memory = render_memory(summary_text, records or {}, episodes or [])
+    if memory:
+        system_parts.append(memory)
     system_content = "\n\n".join(system_parts)
     system_cost = estimate_tokens(system_content) if system_content else 0
 

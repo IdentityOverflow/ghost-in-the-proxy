@@ -42,6 +42,27 @@ CREATE TABLE IF NOT EXISTS summaries (
     ts REAL DEFAULT (unixepoch('subsec')),
     PRIMARY KEY (session, seq)
 );
+CREATE TABLE IF NOT EXISTS records (
+    session TEXT NOT NULL,
+    seq INTEGER NOT NULL,           -- creation order among records
+    generation INTEGER NOT NULL,    -- steward pass that produced it
+    kind TEXT NOT NULL,             -- 'fact' | 'decision' | 'commitment'
+    payload TEXT NOT NULL,          -- JSON per kind
+    provenance_seq INTEGER NOT NULL,
+    superseded INTEGER NOT NULL DEFAULT 0,
+    ts REAL DEFAULT (unixepoch('subsec')),
+    PRIMARY KEY (session, seq)
+);
+CREATE TABLE IF NOT EXISTS episodes (
+    session TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    span_from INTEGER NOT NULL,
+    span_to INTEGER NOT NULL,
+    summary TEXT NOT NULL,
+    superseded INTEGER NOT NULL DEFAULT 0,
+    ts REAL DEFAULT (unixepoch('subsec')),
+    PRIMARY KEY (session, seq)
+);
 """
 
 
@@ -168,9 +189,19 @@ class MindStore:
                 " AND seq < ? AND superseded_by IS NULL",
                 (by_seq, session_id, from_seq, by_seq),
             )
-            # Summaries covering superseded ground truth are invalid.
+            # Derived state built from superseded ground truth is invalid.
+            # (Ledger generations from before the fork are not auto-restored;
+            # the next steward pass rebuilds from live events. v1 tradeoff.)
             self._conn.execute(
                 "UPDATE summaries SET superseded = 1 WHERE session = ? AND upto_seq >= ?",
+                (session_id, from_seq),
+            )
+            self._conn.execute(
+                "UPDATE records SET superseded = 1 WHERE session = ? AND provenance_seq >= ?",
+                (session_id, from_seq),
+            )
+            self._conn.execute(
+                "UPDATE episodes SET superseded = 1 WHERE session = ? AND span_to >= ?",
                 (session_id, from_seq),
             )
 
@@ -193,4 +224,76 @@ class MindStore:
             self._conn.execute(
                 "INSERT INTO summaries (session, seq, upto_seq, content) VALUES (?, ?, ?, ?)",
                 (session_id, row[0] + 1, upto_seq, content),
+            )
+
+    # -- structured records (v1 steward) --------------------------------------
+
+    def live_records(self, session_id: str) -> dict[str, list[dict[str, Any]]]:
+        """Current ledger, grouped by kind (facts / decisions / commitments)."""
+        rows = self._conn.execute(
+            "SELECT kind, payload FROM records WHERE session = ? AND superseded = 0 ORDER BY seq",
+            (session_id,),
+        ).fetchall()
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for kind, payload in rows:
+            grouped.setdefault(kind, []).append(json.loads(payload))
+        return grouped
+
+    def replace_records(
+        self,
+        session_id: str,
+        records: dict[str, list[dict[str, Any]]],
+        provenance_seq: int,
+    ) -> None:
+        """Version the whole ledger: supersede the old generation, append the new.
+
+        The steward proposes the complete updated state each pass; generation
+        versioning keeps application deterministic (no record matching) while
+        preserving the append-only history.
+        """
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(generation), 0), COALESCE(MAX(seq), 0) FROM records"
+                " WHERE session = ?",
+                (session_id,),
+            ).fetchone()
+            generation, seq = row[0] + 1, row[1]
+            self._conn.execute(
+                "UPDATE records SET superseded = 1 WHERE session = ? AND superseded = 0",
+                (session_id,),
+            )
+            for kind, items in records.items():
+                for item in items:
+                    seq += 1
+                    self._conn.execute(
+                        "INSERT INTO records (session, seq, generation, kind, payload, provenance_seq)"
+                        " VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            session_id,
+                            seq,
+                            generation,
+                            kind,
+                            json.dumps(item, ensure_ascii=False, sort_keys=True),
+                            provenance_seq,
+                        ),
+                    )
+
+    # -- episodes -------------------------------------------------------------
+
+    def live_episodes(self, session_id: str) -> list[tuple[int, int, str]]:
+        rows = self._conn.execute(
+            "SELECT span_from, span_to, summary FROM episodes WHERE session = ? AND superseded = 0"
+            " ORDER BY seq",
+            (session_id,),
+        ).fetchall()
+        return [(row[0], row[1], row[2]) for row in rows]
+
+    def append_episode(self, session_id: str, span_from: int, span_to: int, summary: str) -> None:
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM episodes WHERE session = ?", (session_id,)
+            ).fetchone()
+            self._conn.execute(
+                "INSERT INTO episodes (session, seq, span_from, span_to, summary) VALUES (?, ?, ?, ?, ?)",
+                (session_id, row[0] + 1, span_from, span_to, summary),
             )

@@ -167,3 +167,53 @@ def test_texture_always_opens_on_user_turn(store):
         workspace = assemble(cfg, None, events, (upto, "earlier turns summary"))
         non_system = [m for m in workspace.messages if m["role"] != "system"]
         assert non_system[0]["role"] == "user", f"upto={upto} opened on {non_system[0]['role']}"
+
+
+def test_ledger_generation_versioning(store):
+    session = store.create_session(None)
+    store.replace_records(session, {"fact": [{"subject": "port", "claim": "8080"}]}, provenance_seq=2)
+    store.replace_records(
+        session,
+        {"fact": [{"subject": "port", "claim": "9090 (was 8080)"}],
+         "commitment": [{"actor": "user", "statement": "rotate token", "status": "open"}]},
+        provenance_seq=6,
+    )
+    live = store.live_records(session)
+    assert live["fact"] == [{"subject": "port", "claim": "9090 (was 8080)"}]
+    assert len(live["commitment"]) == 1
+
+
+def test_fork_invalidates_derived_records(store):
+    session = store.create_session(None)
+    store.append_event(session, user("q1"), source="client")
+    store.append_event(session, assistant("a1"), source="mind")
+    store.append_event(session, user("q2"), source="client")
+    store.replace_records(session, {"fact": [{"subject": "x", "claim": "y"}]}, provenance_seq=3)
+    store.append_episode(session, 1, 3, "early events")
+    replacement = store.append_event(session, user("q2-edited"), source="client")
+    store.supersede_from(session, 3, replacement)
+    assert store.live_records(session) == {}
+    assert store.live_episodes(session) == []
+
+
+def test_render_memory_sections():
+    from server.mind.assembler import render_memory
+
+    text = render_memory(
+        "",
+        {
+            "decision": [{"topic": "sync", "status": "leaning", "choice": "Turnstile", "reason": "simple"}],
+            "commitment": [
+                {"actor": "user", "statement": "rotate token", "trigger": "deployment", "status": "open"},
+                {"actor": "user", "statement": "old thing", "status": "done"},
+            ],
+            "fact": [{"subject": "port", "claim": "9090 (was 8080)"}],
+        },
+        [(1, 6, "planned the app")],
+    )
+    assert "sync: LEANING — Turnstile (reason: simple)" in text
+    assert "rotate token — trigger: deployment" in text
+    assert "old thing" not in text  # done commitments stay out of the open list
+    assert "port: 9090 (was 8080)" in text
+    assert "planned the app" in text
+    assert render_memory("", {}, []) == ""  # empty memory renders nothing
