@@ -8,11 +8,27 @@ texture — the summarizer guarantees that ordering.
 """
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .config import MindConfig
+from .dynamics import ThreadState
 from .store import Event
+
+
+@dataclass
+class ThreadsView:
+    """Attention state the runtime computed for this request (v2 CRS).
+
+    Facts attached to a thread render only while that thread is admitted or
+    cued — salience decides, the assembler only enforces. Facts whose thread
+    key is unknown (or absent) always render: a steward that proposes no
+    threads degrades exactly to v1 behavior, never to silence.
+    """
+
+    admitted: list[ThreadState] = field(default_factory=list)
+    cued: list[ThreadState] = field(default_factory=list)
+    all_keys: set[str] = field(default_factory=set)
 
 MIND_HEADER = (
     "## Conversation memory\n"
@@ -34,10 +50,18 @@ def render_memory(
     summary_text: str,
     records: dict[str, list[dict[str, Any]]],
     episodes: list[tuple[int, int, str]],
+    threads: ThreadsView | None = None,
 ) -> str:
     """Render the structured ledger + episodes (+ prose fallback) as the
     memory section of the system prompt. Empty sections are omitted."""
     sections: list[str] = []
+    if threads and threads.admitted:
+        lines = []
+        for thread in threads.admitted:
+            lines.append(f"- {thread.key}: {thread.summary}")
+            for question in thread.open_questions:
+                lines.append(f"  - open question: {question}")
+        sections.append("### Active threads (what is currently in play)\n" + "\n".join(lines))
     decisions = records.get("decision", [])
     if decisions:
         lines = []
@@ -58,9 +82,25 @@ def render_memory(
         ]
         sections.append("### Open commitments (complete list of tracked items)\n" + "\n".join(lines))
     facts = records.get("fact", [])
+    if threads is not None:
+        visible_keys = {thread.key for thread in threads.admitted}
+        facts = [
+            item
+            for item in facts
+            if item.get("thread") not in threads.all_keys or item.get("thread") in visible_keys
+        ]
     if facts:
         lines = [f"- {item.get('subject')}: {item.get('claim')}" for item in facts]
         sections.append("### Facts\n" + "\n".join(lines))
+    if threads and threads.cued:
+        lines = []
+        for thread in threads.cued:
+            lines.append(f"- {thread.key}: {thread.summary}")
+            for fact in thread.facts:
+                lines.append(f"  - {fact.get('subject')}: {fact.get('claim')}")
+        sections.append(
+            "### Recalled (dormant memory cued by the latest message)\n" + "\n".join(lines)
+        )
     if episodes:
         lines = [f"- {summary}" for _, _, summary in episodes]
         sections.append("### Earlier events\n" + "\n".join(lines))
@@ -108,6 +148,7 @@ def assemble(
     summary: tuple[int, str] | None,
     records: dict[str, list[dict[str, Any]]] | None = None,
     episodes: list[tuple[int, int, str]] | None = None,
+    threads: ThreadsView | None = None,
 ) -> Workspace:
     reserve = max(int(config.window * config.reserve_fraction), 1024)
     # chars/4 underestimates real tokenizers by ~20% (measured against
@@ -118,7 +159,7 @@ def assemble(
     if client_system:
         system_parts.append(client_system)
     summary_upto, summary_text = (summary or (0, ""))
-    memory = render_memory(summary_text, records or {}, episodes or [])
+    memory = render_memory(summary_text, records or {}, episodes or [], threads)
     if memory:
         system_parts.append(memory)
     system_content = "\n\n".join(system_parts)

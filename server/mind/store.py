@@ -63,6 +63,28 @@ CREATE TABLE IF NOT EXISTS episodes (
     ts REAL DEFAULT (unixepoch('subsec')),
     PRIMARY KEY (session, seq)
 );
+CREATE TABLE IF NOT EXISTS threads (
+    session TEXT NOT NULL,
+    seq INTEGER NOT NULL,           -- creation order among thread rows
+    generation INTEGER NOT NULL,    -- steward pass that produced it
+    key TEXT NOT NULL,              -- stable slug; carries dynamics across generations
+    payload TEXT NOT NULL,          -- JSON: kind, summary, anchors[], open_questions[]
+    provenance_seq INTEGER NOT NULL,
+    superseded INTEGER NOT NULL DEFAULT 0,
+    ts REAL DEFAULT (unixepoch('subsec')),
+    PRIMARY KEY (session, seq)
+);
+-- Deliberate exception to the append-only invariant: activation/importance
+-- are runtime-computed dynamics, reconstructible from events — a cache of
+-- the mind's attention, not conversation truth. Updated in place.
+CREATE TABLE IF NOT EXISTS thread_dynamics (
+    session TEXT NOT NULL,
+    key TEXT NOT NULL,
+    activation REAL NOT NULL,
+    importance REAL NOT NULL,
+    updated_seq INTEGER NOT NULL,   -- last event seq applied (tick idempotence)
+    PRIMARY KEY (session, key)
+);
 """
 
 
@@ -204,6 +226,10 @@ class MindStore:
                 "UPDATE episodes SET superseded = 1 WHERE session = ? AND span_to >= ?",
                 (session_id, from_seq),
             )
+            self._conn.execute(
+                "UPDATE threads SET superseded = 1 WHERE session = ? AND provenance_seq >= ?",
+                (session_id, from_seq),
+            )
 
     # -- summaries ----------------------------------------------------------
 
@@ -277,6 +303,72 @@ class MindStore:
                             provenance_seq,
                         ),
                     )
+
+    # -- threads (v2 CRS) ------------------------------------------------------
+
+    def live_threads(self, session_id: str) -> list[dict[str, Any]]:
+        """Current thread structure: payload dicts with 'key' merged in."""
+        rows = self._conn.execute(
+            "SELECT key, payload FROM threads WHERE session = ? AND superseded = 0 ORDER BY seq",
+            (session_id,),
+        ).fetchall()
+        return [{"key": row[0], **json.loads(row[1])} for row in rows]
+
+    def replace_threads(
+        self, session_id: str, threads: list[dict[str, Any]], provenance_seq: int
+    ) -> None:
+        """Version the whole thread set, same pattern as replace_records."""
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(generation), 0), COALESCE(MAX(seq), 0) FROM threads"
+                " WHERE session = ?",
+                (session_id,),
+            ).fetchone()
+            generation, seq = row[0] + 1, row[1]
+            self._conn.execute(
+                "UPDATE threads SET superseded = 1 WHERE session = ? AND superseded = 0",
+                (session_id,),
+            )
+            for thread in threads:
+                key = str(thread.get("key") or "").strip()
+                if not key:
+                    continue
+                payload = {k: v for k, v in thread.items() if k != "key"}
+                seq += 1
+                self._conn.execute(
+                    "INSERT INTO threads (session, seq, generation, key, payload, provenance_seq)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        session_id,
+                        seq,
+                        generation,
+                        key,
+                        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                        provenance_seq,
+                    ),
+                )
+
+    def get_dynamics(self, session_id: str) -> dict[str, tuple[float, float, int]]:
+        """key -> (activation, importance, updated_seq)."""
+        rows = self._conn.execute(
+            "SELECT key, activation, importance, updated_seq FROM thread_dynamics"
+            " WHERE session = ?",
+            (session_id,),
+        ).fetchall()
+        return {row[0]: (row[1], row[2], row[3]) for row in rows}
+
+    def set_dynamics(
+        self, session_id: str, key: str, activation: float, importance: float, updated_seq: int
+    ) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO thread_dynamics (session, key, activation, importance, updated_seq)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(session, key) DO UPDATE SET"
+                " activation = excluded.activation, importance = excluded.importance,"
+                " updated_seq = excluded.updated_seq",
+                (session_id, key, activation, importance, updated_seq),
+            )
 
     # -- episodes -------------------------------------------------------------
 

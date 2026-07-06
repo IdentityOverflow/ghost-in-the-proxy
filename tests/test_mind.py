@@ -217,3 +217,169 @@ def test_render_memory_sections():
     assert "port: 9090 (was 8080)" in text
     assert "planned the app" in text
     assert render_memory("", {}, []) == ""  # empty memory renders nothing
+
+
+# -- v2 CRS dynamics ----------------------------------------------------------
+
+
+def make_thread(key, summary, **kw):
+    from server.mind.dynamics import ThreadState
+
+    return ThreadState(key=key, kind=kw.pop("kind", "topic"), summary=summary, **kw)
+
+
+def test_dynamics_decay_and_input():
+    from server.mind.dynamics import ACTIVE_THRESHOLD, update_dynamics
+
+    logging = make_thread(
+        "logging-pipeline",
+        "Designing a vector to Loki logging pipeline for five Raspberry Pis.",
+        anchors=["vector", "loki", "journald", "grafana"],
+    )
+    aside = make_thread(
+        "dumpling-aside",
+        "Grandmother's plum dumpling trick: semolina instead of flour.",
+        kind="aside",
+        anchors=["semolina", "plum", "dumplings", "grandmother"],
+    )
+    threads = [logging, aside]
+    for message in [
+        "What labels should I put on the loki streams?",
+        "Now the retention policy for loki, 30 days hot.",
+        "One Pi is on flaky wifi, what happens to logs when the link drops?",
+        "Configure that vector disk buffer, 200 MB cap.",
+        "Add a grafana alert for any Pi silent 15 minutes.",
+    ]:
+        update_dynamics(threads, message)
+    # The working topic stays admitted; the untouched aside decays out.
+    assert logging.activation >= ACTIVE_THRESHOLD
+    assert aside.activation < ACTIVE_THRESHOLD
+    # Decay is not deletion: importance floor keeps it retrievable, not zero.
+    assert aside.importance > 0.0
+
+
+def test_dynamics_question_attractor():
+    from server.mind.dynamics import update_dynamics
+
+    inquiry = make_thread(
+        "retention-question",
+        "Open question about archival.",
+        kind="inquiry",
+        open_questions=["Should thread importance decay over time?"],
+        activation=0.2,
+    )
+    control = make_thread("control", "Open question about archival.", activation=0.2)
+    update_dynamics([inquiry, control], "I think importance should decay over time, yes.")
+    assert inquiry.activation > control.activation + 0.2  # attractor fired
+
+
+def test_cued_recall_of_dormant_thread():
+    from server.mind.dynamics import cued_threads
+
+    aside = make_thread(
+        "dumpling-aside",
+        "Grandmother's plum dumpling trick: semolina instead of flour.",
+        kind="aside",
+        anchors=["semolina", "plum dumplings", "grandmother"],
+        activation=0.05,
+    )
+    # Generic on-topic message must NOT cue it...
+    assert cued_threads([aside], "anything else worth batching or buffering?", []) == []
+    # ...but an explicit reach for it must.
+    cue = "what was that trick from my grandmother's recipe I mentioned way back?"
+    assert [t.key for t in cued_threads([aside], cue, [])] == ["dumpling-aside"]
+
+
+def test_cued_recall_survives_chatty_cue_live_repro():
+    """Regression: run 20260706-101717 missed the s5 cue by a coverage hair.
+
+    Thread content is the VERBATIM steward output from that run; the cue is
+    the VERBATIM s5 turn-15 message. Chatty cues dilute coverage (9 content
+    words, 2 hits), and possessives must collapse (grandmother's ->
+    grandmother) on both sides.
+    """
+    from server.mind.dynamics import cued_threads
+
+    aside = make_thread(
+        "plum-dumplings",
+        "A brief mention of a grandmother's trick for making lighter plum "
+        "dumplings using semolina.",
+        kind="aside",
+        anchors=["plum dumplings", "semolina"],
+        activation=0.05,
+        facts=[
+            {
+                "subject": "plum_dumpling_trick",
+                "thread": "plum-dumplings",
+                "claim": "Use semolina instead of flour in the dough to make them lighter.",
+            }
+        ],
+    )
+    cue = (
+        "Totally different thing before I go cook — what was that trick "
+        "from my grandmother's recipe I mentioned way back?"
+    )
+    assert [t.key for t in cued_threads([aside], cue, [])] == ["plum-dumplings"]
+    # The two on-topic probes around it must still not cue the aside.
+    for message in (
+        "We're batching sinks now. Open question: anything else in this "
+        "pipeline you think is worth batching or buffering that we haven't covered?",
+        "Right! Okay, one-paragraph summary of what we designed today.",
+    ):
+        assert cued_threads([aside], message, []) == []
+
+
+def test_render_memory_thread_gating():
+    from server.mind.assembler import ThreadsView, render_memory
+
+    aside = make_thread(
+        "dumpling-aside",
+        "Plum dumpling trick.",
+        kind="aside",
+        facts=[{"subject": "dumpling_trick", "thread": "dumpling-aside", "claim": "semolina not flour"}],
+    )
+    records = {
+        "fact": [
+            {"subject": "dumpling_trick", "thread": "dumpling-aside", "claim": "semolina not flour"},
+            {"subject": "log_volume", "thread": "logging-pipeline", "claim": "50 MB/day"},
+            {"subject": "threadless", "claim": "always renders"},
+        ],
+        "commitment": [{"actor": "user", "statement": "rotate token", "status": "open"}],
+    }
+    logging = make_thread("logging-pipeline", "Vector to Loki pipeline.", activation=0.9)
+    view = ThreadsView(admitted=[logging], cued=[], all_keys={"logging-pipeline", "dumpling-aside"})
+    text = render_memory("", records, [], view)
+    assert "log_volume" in text                       # admitted thread's fact renders
+    assert "threadless: always renders" in text       # no thread -> safe fallback
+    assert "semolina" not in text                     # dormant thread's fact gated out
+    assert "Active threads" in text and "logging-pipeline" in text
+    assert "rotate token" in text                     # commitments always render
+
+    # Cue the aside back in: fact returns under the Recalled section.
+    view = ThreadsView(admitted=[logging], cued=[aside], all_keys={"logging-pipeline", "dumpling-aside"})
+    text = render_memory("", records, [], view)
+    assert "Recalled" in text and "semolina not flour" in text
+
+
+def test_store_threads_versioning_and_fork(store):
+    sid = store.create_session(None)
+    store.append_event(sid, user("q1"), source="client")
+    store.replace_threads(sid, [{"key": "alpha", "summary": "one"}], provenance_seq=1)
+    store.replace_threads(
+        sid,
+        [{"key": "alpha", "summary": "updated"}, {"key": "beta", "summary": "two"}],
+        provenance_seq=1,
+    )
+    live = store.live_threads(sid)
+    assert {t["key"] for t in live} == {"alpha", "beta"}
+    assert [t["summary"] for t in live if t["key"] == "alpha"] == ["updated"]
+
+    store.set_dynamics(sid, "alpha", 0.7, 0.4, updated_seq=1)
+    store.set_dynamics(sid, "alpha", 0.6, 0.41, updated_seq=2)  # upsert, not append
+    assert store.get_dynamics(sid)["alpha"] == (0.6, 0.41, 2)
+
+    # Fork before the provenance seq invalidates the thread structure.
+    for i in range(2, 6):
+        store.append_event(sid, user(f"q{i}"), source="client")
+    store.supersede_from(sid, from_seq=1, by_seq=5)
+    assert store.live_threads(sid) == []

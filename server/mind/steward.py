@@ -22,8 +22,11 @@ STEWARD_SYSTEM = """You maintain the structured memory of a conversation. Given 
 memory and new conversation turns, output the COMPLETE UPDATED memory as JSON, nothing else:
 
 {
+  "threads": [
+    {"key": "<stable-kebab-slug>", "kind": "topic" | "aside" | "inquiry", "summary": "<1-2 sentences: what this line of conversation is about and where it stands>", "anchors": ["<distinctive concrete words: names, tools, dishes, places>"], "open_questions": ["<questions raised in this thread and not yet answered>"]}
+  ],
   "facts": [
-    {"subject": "<short key>", "claim": "<current truth; if corrected, only the new value, noting the old as superseded>"}
+    {"subject": "<short key>", "thread": "<key of the thread this belongs to>", "claim": "<current truth; if corrected, only the new value, noting the old as superseded>"}
   ],
   "decisions": [
     {"topic": "<short key>", "status": "decided" | "leaning" | "open", "choice": "<what>", "reason": "<why, if given>"}
@@ -42,7 +45,8 @@ Rules:
 - When the user says "remind me to X", "don't let me forget X", or "before we ship, X" — that is an OPEN commitment; record it verbatim with its trigger.
 - Corrections replace the fact's claim; note the superseded value inside the claim (e.g. "9090 (was 8080, port collision)").
 - Record distinctive one-off details and personal asides as facts, even if they seem irrelevant.
-- Keep numbers, names, and file paths exact. Never invent entries."""
+- Keep numbers, names, and file paths exact. Never invent entries.
+- Threads partition the conversation: the main line of work is ONE "topic" thread; a personal aside or one-off tangent gets its own small "aside" thread. Reuse existing thread keys — never rename them. Every fact's "thread" must be one of the listed thread keys."""
 
 
 class StewardParseError(Exception):
@@ -68,6 +72,7 @@ async def run_steward(
     ledger = store.live_records(session_id)
     current_memory = json.dumps(
         {
+            "threads": store.live_threads(session_id),
             "facts": ledger.get("fact", []),
             "decisions": ledger.get("decision", []),
             "commitments": ledger.get("commitment", []),
@@ -106,6 +111,9 @@ async def run_steward(
         },
         provenance_seq=upto_seq,
     )
+    threads = [item for item in proposal.get("threads", []) if isinstance(item, dict)]
+    if threads:
+        store.replace_threads(session_id, threads, provenance_seq=upto_seq)
     episode = str(proposal.get("episode") or "").strip()
     if episode:
         store.append_episode(session_id, fold[0].seq, upto_seq, episode)
@@ -127,7 +135,7 @@ def _parse_proposal(content: str) -> dict[str, Any]:
         raise StewardParseError(f"steward JSON invalid: {error}") from error
     if not isinstance(data, dict):
         raise StewardParseError("steward output is not an object")
-    for key in ("facts", "decisions", "commitments"):
+    for key in ("facts", "decisions", "commitments", "threads"):
         if not isinstance(data.get(key, []), list):
             raise StewardParseError(f"steward field {key} is not a list")
     return data
