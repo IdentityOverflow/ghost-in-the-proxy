@@ -96,6 +96,30 @@ def test_regenerate_last_reply(store):
     assert live == ["q1", "second draft answer", "q2"]
 
 
+def test_regenerate_request_drops_tail_not_session(store):
+    """The regenerate REQUEST itself: client resends history minus our last
+    reply, nothing new after it. Must stay in-session with the tail dropped,
+    not spawn a fresh mind (live bug found designing s7)."""
+    play_turn(store, [user("q1")], "a1")
+    recon1, _ = play_turn(store, [user("q1"), assistant("a1"), user("q2")], "first draft")
+
+    regenerate_request = [user("q1"), assistant("a1"), user("q2")]
+    recon2 = reconcile(store, regenerate_request)
+    assert recon2.session_id == recon1.session_id
+    assert recon2.outcome == "fork"
+    assert recon2.new_events == []
+    live = [e.message.get("content") for e in store.live_events(recon2.session_id)]
+    assert live == ["q1", "a1", "q2"]  # first draft superseded, prefix intact
+
+    # Our second draft gets appended and the client retains it: continue.
+    seq = store.append_event(recon2.session_id, assistant("second draft"), source="mind")
+    recon3 = reconcile(store, regenerate_request + [assistant("second draft"), user("q3")])
+    assert recon3.outcome == "continue"
+    assert recon3.session_id == recon1.session_id
+    live = [e.message.get("content") for e in store.live_events(recon3.session_id)]
+    assert live == ["q1", "a1", "q2", "second draft", "q3"]
+
+
 def test_unrelated_transcript_is_new_session(store):
     play_turn(store, [user("about cats")], "meow")
     recon = reconcile(store, [user("about dogs")])
@@ -383,3 +407,48 @@ def test_store_threads_versioning_and_fork(store):
         store.append_event(sid, user(f"q{i}"), source="client")
     store.supersede_from(sid, from_seq=1, by_seq=5)
     assert store.live_threads(sid) == []
+
+
+def test_steward_chunks_oversized_folds(store):
+    """A huge fold span (post-fork re-fold) must become several capped
+    steward passes, each advancing the watermark, never one giant call."""
+    import asyncio
+
+    from server.mind.steward import run_steward
+
+    sid = store.create_session(None)
+    events = []
+    for i in range(1, 13):
+        role = "user" if i % 2 else "assistant"
+        seq = store.append_event(sid, {"role": role, "content": f"msg{i} " + "x" * 1200}, source="client")
+    events = store.live_events(sid)
+
+    calls = []
+
+    class Provider:
+        async def chat_completions(self, payload):
+            calls.append(payload["messages"][1]["content"])
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"threads": [], "facts": [{"subject": "s", "claim": "c"}],'
+                                ' "decisions": [], "commitments": [],'
+                                ' "episode": "things happened"}'
+                            )
+                        }
+                    }
+                ]
+            }
+
+    cfg = config(steward_input_tokens=900)
+    asyncio.run(run_steward(cfg, store, sid, events, Provider(), "m", upto_seq=12))
+    assert len(calls) > 1  # ~12*300 est tokens vs 900 cap -> several passes
+    for content in calls:
+        # No single pass may carry more transcript than roughly the cap.
+        transcript = content.split("New turns:\n", 1)[1]
+        assert len(transcript) // 4 < 900 + 400  # cap + one-event slack
+    episodes = store.live_episodes(sid)
+    assert len(episodes) == len(calls)
+    assert episodes[-1][1] == 12  # watermark reached the requested boundary

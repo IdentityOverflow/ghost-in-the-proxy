@@ -62,13 +62,43 @@ async def run_steward(
     model: str,
     upto_seq: int,
 ) -> None:
-    """Fold events up to upto_seq into the ledger and an episode line."""
+    """Fold events up to upto_seq into the ledger and an episode line.
+
+    Oversized fold spans (a deep fork invalidates the ledger, making the
+    next fold cover the whole live history) are chunked into sequential
+    passes so no single extraction call can overflow the model's window.
+    """
     episodes = store.live_episodes(session_id)
     folded_upto = max((span_to for _, span_to, _ in episodes), default=0)
     fold = [event for event in events if folded_upto < event.seq <= upto_seq]
     if not fold:
         return
+    for chunk in _chunks(fold, config.steward_input_tokens):
+        await _fold_pass(config, store, session_id, chunk, provider, model)
 
+
+def _chunks(fold: list[Event], cap_tokens: int) -> list[list[Event]]:
+    chunks: list[list[Event]] = [[]]
+    spent = 0
+    for event in fold:
+        cost = estimate_tokens(_flatten(event.message))
+        if chunks[-1] and spent + cost > cap_tokens:
+            chunks.append([])
+            spent = 0
+        chunks[-1].append(event)
+        spent += cost
+    return [chunk for chunk in chunks if chunk]
+
+
+async def _fold_pass(
+    config: MindConfig,
+    store: MindStore,
+    session_id: str,
+    fold: list[Event],
+    provider: Any,
+    model: str,
+) -> None:
+    upto_seq = fold[-1].seq
     ledger = store.live_records(session_id)
     current_memory = json.dumps(
         {

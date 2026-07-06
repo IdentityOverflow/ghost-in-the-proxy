@@ -21,6 +21,10 @@ class MindConfig(BaseModel):
     fold_ahead_tokens: int = int(os.getenv("MIND_FOLD_AHEAD_TOKENS", "700"))
     # Never fold the most recent N user turns; they stay verbatim.
     min_keep_turns: int = int(os.getenv("MIND_MIN_KEEP_TURNS", "2"))
+    # Cap on the transcript tokens handed to one steward pass; larger fold
+    # spans (e.g. the re-fold after a deep fork) are chunked into sequential
+    # passes instead of overflowing the extraction model's window.
+    steward_input_tokens: int = int(os.getenv("MIND_STEWARD_INPUT_TOKENS", "2600"))
     # Model used for summarization/extraction; empty = the request's model.
     extraction_model: str | None = os.getenv("MIND_EXTRACTION_MODEL") or None
     # "open": mind errors fall back to passthrough (production posture).

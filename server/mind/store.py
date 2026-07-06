@@ -192,6 +192,13 @@ class MindStore:
             )
         return seq
 
+    def next_seq(self, session_id: str) -> int:
+        """The seq the next appended event will receive."""
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session = ?", (session_id,)
+        ).fetchone()
+        return row[0] + 1
+
     def confirm_event(self, session_id: str, seq: int) -> None:
         with self._lock, self._conn:
             self._conn.execute(

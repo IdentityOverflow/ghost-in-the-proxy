@@ -41,6 +41,9 @@ MIND_HEADER = (
     "something already agreed or discussed.\n"
     "- A decision marked LEANING is NOT decided. Never say 'we decided' "
     "about it; say it is still open.\n"
+    "- When asked for a status, recap, or summary, name the concrete items "
+    "from these records with their true status (decided vs still open) — "
+    "not vague phrases like 'finalizing the architecture'.\n"
     "- Never invent decisions, agreements, or tracked items that are not in "
     "these records or the recent turns."
 )

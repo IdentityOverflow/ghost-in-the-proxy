@@ -109,6 +109,15 @@ def reconcile(store: MindStore, messages: list[dict[str, Any]]) -> Reconciliatio
             _ingest(store, session_id, new)
             store.set_client_system(session_id, client_system)
             return Reconciliation(session_id, "continue", new)
+        if not diverged and matched == len(incoming) and matched >= 2:
+            # The client resent a strict prefix of our history: it dropped our
+            # tail (regenerate request, delete-last-reply). The dropped events
+            # are no longer the client's truth; supersede them by the reply we
+            # are about to append (next seq) and answer from the kept prefix.
+            drop_from = events[matched].seq
+            store.supersede_from(session_id, drop_from, store.next_seq(session_id))
+            store.set_client_system(session_id, client_system)
+            return Reconciliation(session_id, "fork", [])
         # Edit/regenerate: shared prefix, then divergence. Unambiguous when
         # both timelines diverge at an assistant message (regenerate), or
         # when the shared prefix is substantial (edit deeper in).
