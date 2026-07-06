@@ -107,8 +107,9 @@ class MockClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
     ) -> ChatResult:
+        # Keep next_reply for the whole turn: the tool-fallback path calls
+        # complete() twice per turn, and the runner resets it every turn.
         reply = self.next_reply or "Acknowledged."
-        self.next_reply = None
         return ChatResult(
             message={"role": "assistant", "content": reply},
             prompt_tokens=estimate_tokens(messages),
