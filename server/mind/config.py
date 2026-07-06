@@ -34,6 +34,10 @@ class MindConfig(BaseModel):
     recall_max_hops: int = int(os.getenv("MIND_RECALL_MAX_HOPS", "3"))
     # v3: scope the client's tool pack per turn (schema bulk is context tax).
     tool_router_enabled: bool = os.getenv("MIND_TOOL_ROUTER", "1") == "1"
+    # v3 containment: tool payloads from PREVIOUS turns render as digests of
+    # this many characters in the workspace (full text stays in the event
+    # store; recall reaches it). 0 disables digestion.
+    tool_digest_chars: int = int(os.getenv("MIND_TOOL_DIGEST_CHARS", "700"))
     # "open": mind errors fall back to passthrough (production posture).
     # "strict": mind errors fail the request loudly — REQUIRED for eval runs,
     # otherwise a crashed mind silently gets graded as the passthrough.

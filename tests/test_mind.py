@@ -548,3 +548,74 @@ def test_prepare_scopes_tools_and_offers_recall(store, tmp_path):
         assert prepared2.session_id == prepared.session_id
 
     asyncio.run(go())
+
+
+def test_stale_tool_payloads_render_as_digests(store):
+    # Small window so the texture is genuinely over budget: digestion is a
+    # pressure response, never a default.
+    cfg = config(window=2048, tool_digest_chars=300)
+    session = store.create_session(None)
+    payload = "LOG " * 800  # ~3200 chars of tool output
+    store.append_event(session, user("check the service"), source="client")
+    store.append_event(
+        session,
+        {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+            "function": {"name": "read", "arguments": "{}"}}]},
+        source="mind",
+    )
+    store.append_event(session, {"role": "tool", "tool_call_id": "c1", "content": payload}, source="client")
+    store.append_event(session, assistant("service looks fine"), source="mind")
+    store.append_event(session, user("and now a new question"), source="client")
+    events = store.live_events(session)
+
+    workspace = assemble(cfg, None, events, (0, ""))
+    tool_messages = [m for m in workspace.messages if m.get("role") == "tool"]
+    assert tool_messages, "stale tool message still present as a digest"
+    assert len(tool_messages[0]["content"]) < 600
+    assert "folded away" in tool_messages[0]["content"]
+    # The event store keeps the full payload (recall's ground truth).
+    stored = [e for e in store.live_events(session) if e.role == "tool"][0]
+    assert len(stored.message["content"]) > 3000
+
+
+def test_current_turn_tool_payload_stays_verbatim(store):
+    cfg = config(window=2048, tool_digest_chars=300)
+    session = store.create_session(None)
+    payload = "DATA " * 700
+    store.append_event(session, user("read the big file"), source="client")
+    store.append_event(
+        session,
+        {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+            "function": {"name": "read", "arguments": "{}"}}]},
+        source="mind",
+    )
+    store.append_event(session, {"role": "tool", "tool_call_id": "c1", "content": payload}, source="client")
+    events = store.live_events(session)
+
+    workspace = assemble(cfg, None, events, (0, ""))
+    tool_messages = [m for m in workspace.messages if m.get("role") == "tool"]
+    # In-flight exchange: the model needs the full payload to answer NOW.
+    assert tool_messages and tool_messages[0]["content"] == payload
+
+
+def test_no_digestion_without_budget_pressure(store):
+    cfg = config(window=8192, tool_digest_chars=300)
+    session = store.create_session(None)
+    payload = "LOG " * 800
+    store.append_event(session, user("check the service"), source="client")
+    store.append_event(
+        session,
+        {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+            "function": {"name": "read", "arguments": "{}"}}]},
+        source="mind",
+    )
+    store.append_event(session, {"role": "tool", "tool_call_id": "c1", "content": payload}, source="client")
+    store.append_event(session, assistant("looks fine"), source="mind")
+    store.append_event(session, user("next question"), source="client")
+    events = store.live_events(session)
+
+    workspace = assemble(cfg, None, events, (0, ""))
+    tool_messages = [m for m in workspace.messages if m.get("role") == "tool"]
+    # Everything fits at 8k: the stale payload must stay verbatim (s2-t5's
+    # evidence must not be digested when the budget could carry it).
+    assert tool_messages and tool_messages[0]["content"] == payload

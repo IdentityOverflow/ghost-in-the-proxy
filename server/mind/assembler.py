@@ -49,6 +49,14 @@ MIND_HEADER = (
 )
 
 
+DIGEST_NOTICE = (
+    "NOTE: some earlier tool outputs below are shown as truncated digests "
+    "marked 'folded away'. If your answer depends on the exact content of a "
+    "digested output, you MUST call recall(...) to read it in full BEFORE "
+    "answering. Answering from a digest guess is an error."
+)
+
+
 def render_memory(
     summary_text: str,
     records: dict[str, list[dict[str, Any]]],
@@ -158,6 +166,7 @@ def assemble(
     # gemma-3 via LM Studio usage); the safety factor absorbs that.
     workspace_budget = int((config.window - reserve) * 0.75)
 
+
     system_parts = []
     if client_system:
         system_parts.append(client_system)
@@ -169,6 +178,24 @@ def assemble(
     system_cost = estimate_tokens(system_content) if system_content else 0
 
     texture_budget = workspace_budget - system_cost
+
+    # Containment (v3): under budget pressure, stale tool payloads render as
+    # digests — the full text stays in the event store, reachable via recall.
+    # Verbatim comes FIRST: digestion is a compression stage before eviction,
+    # never a default (digesting a payload the budget could have carried cost
+    # s2-t5 at 4k while the baseline still had the evidence in view).
+    render: dict[int, Any] = {event.seq: event.message for event in events}
+    candidate_cost = sum(
+        estimate_tokens(event.message) for event in events if event.seq > summary_upto
+    )
+    if candidate_cost > texture_budget:
+        render = _digest_stale_tool_events(config, events)
+    digested = any(render[event.seq] is not event.message for event in events)
+    if digested and system_content:
+        system_content += "\n\n" + DIGEST_NOTICE
+        system_cost = estimate_tokens(system_content)
+        texture_budget = workspace_budget - system_cost
+
     blocks = _texture_blocks(events)
 
     # Newest blocks first until the budget is spent; never evict events the
@@ -177,7 +204,7 @@ def assemble(
     chosen: list[list[Event]] = []
     spent = 0
     for block in reversed(blocks):
-        cost = sum(estimate_tokens(event.message) for event in block)
+        cost = sum(estimate_tokens(render[event.seq]) for event in block)
         if chosen and spent + cost > texture_budget:
             break
         chosen.append(block)
@@ -217,13 +244,44 @@ def assemble(
     messages: list[dict[str, Any]] = []
     if system_content:
         messages.append({"role": "system", "content": system_content})
-    messages.extend(event.message for event in texture_events)
+    messages.extend(render[event.seq] for event in texture_events)
 
     return Workspace(
         messages=messages,
         texture_from_seq=texture_events[0].seq if texture_events else 0,
         desired_from_seq=desired_from_seq,
-        estimated_tokens=system_cost + sum(estimate_tokens(event.message) for event in texture_events),
+        estimated_tokens=system_cost
+        + sum(estimate_tokens(render[event.seq]) for event in texture_events),
     )
+
+
+def _digest_stale_tool_events(config: MindConfig, events: list[Event]) -> dict[int, Any]:
+    """Per-seq render map: stale bulky tool payloads become head digests.
+
+    'Stale' = before the latest user turn; the current turn's in-flight tool
+    exchange stays verbatim (the model needs it to answer NOW). The event
+    store is untouched — reconciliation still sees full payloads, and recall
+    retrieves them verbatim.
+    """
+    render: dict[int, Any] = {event.seq: event.message for event in events}
+    cap = config.tool_digest_chars
+    if cap <= 0:
+        return render
+    last_user_seq = max((event.seq for event in events if event.role == "user"), default=0)
+    for event in events:
+        content = event.message.get("content")
+        if (
+            event.role == "tool"
+            and event.seq < last_user_seq
+            and isinstance(content, str)
+            and len(content) > cap + 200  # only digest when it actually saves
+        ):
+            digest = (
+                content[:cap]
+                + f"\n…[{len(content) - cap} chars of tool output folded away — "
+                'call recall("<distinctive words>") for the full text]'
+            )
+            render[event.seq] = {**event.message, "content": digest}
+    return render
 
 
