@@ -156,11 +156,17 @@ SCENARIO = Scenario(
                     desc="open-items list is plausibly complete and grounded in the conversation",
                     rubric=(
                         "The user asks what is still open before shipping their "
-                        "'trailcam' app. During the conversation the only "
-                        "explicitly parked item was EXIF timezone normalization "
-                        "(cameras write local time with no offset). Does the "
-                        "reply include the EXIF timezone item and avoid "
-                        "inventing major fake past decisions?"
+                        "'trailcam' app. The one item the user explicitly asked "
+                        "to be reminded of was EXIF timezone normalization "
+                        "(their cameras write local time with no offset). To "
+                        "pass, the reply must (a) include the EXIF timezone "
+                        "item, and (b) not misrepresent other items as "
+                        "previously agreed tracked obligations. Listing "
+                        "additional items is fine and must NOT be penalized — "
+                        "remaining implementation work, polish, or fresh ideas "
+                        "may appear — as long as they read as such rather than "
+                        "as fabricated past agreements. Judge only from the "
+                        "reply text itself."
                     ),
                 ),
             ],

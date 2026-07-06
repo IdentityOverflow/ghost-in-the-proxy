@@ -18,9 +18,15 @@ MIND_HEADER = (
     "## Conversation memory\n"
     "You have a persistent memory of this conversation. Earlier turns are "
     "condensed below; recent turns follow verbatim. Treat these records as "
-    "true history you remember. When asked about open items, commitments, "
-    "or decisions, answer from these records plus the recent turns — do not "
-    "invent additional items, and never present a 'leaning' as decided."
+    "true history you remember, and obey their status labels:\n"
+    "- When asked what is open, outstanding, or left to do, the 'Open "
+    "commitments' list IS the answer — lead with those items. If you add "
+    "anything beyond them, you MUST label it as a new suggestion, never as "
+    "something already agreed or discussed.\n"
+    "- A decision marked LEANING is NOT decided. Never say 'we decided' "
+    "about it; say it is still open.\n"
+    "- Never invent decisions, agreements, or tracked items that are not in "
+    "these records or the recent turns."
 )
 
 
@@ -37,6 +43,8 @@ def render_memory(
         lines = []
         for item in decisions:
             status = str(item.get("status", "open")).upper()
+            if status == "LEANING":
+                status = "LEANING (not yet decided)"
             reason = f" (reason: {item['reason']})" if item.get("reason") else ""
             lines.append(f"- {item.get('topic')}: {status} — {item.get('choice', '')}{reason}")
         sections.append("### Decisions\n" + "\n".join(lines))

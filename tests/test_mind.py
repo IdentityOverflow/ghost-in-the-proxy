@@ -211,7 +211,7 @@ def test_render_memory_sections():
         },
         [(1, 6, "planned the app")],
     )
-    assert "sync: LEANING — Turnstile (reason: simple)" in text
+    assert "sync: LEANING (not yet decided) — Turnstile (reason: simple)" in text
     assert "rotate token — trigger: deployment" in text
     assert "old thing" not in text  # done commitments stay out of the open list
     assert "port: 9090 (was 8080)" in text
