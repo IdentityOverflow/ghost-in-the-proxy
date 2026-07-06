@@ -111,6 +111,7 @@ async def run_scenario(
     log: bool = True,
     wall: int | None = None,
     wall_mode: str = "strict",
+    judge_votes: int = 1,
 ) -> ScenarioResult:
     messages: list[dict[str, Any]] = []
     if scenario.system_prompt:
@@ -124,6 +125,8 @@ async def run_scenario(
     for index, turn in enumerate(scenario.turns, start=1):
         if isinstance(client, MockClient):
             client.next_reply = turn.mock_reply
+        if turn.rewind_user_turns:
+            _rewind(messages, turn.rewind_user_turns)
         messages.append({"role": "user", "content": turn.user})
         try:
             record = await _play_turn(index, turn, scenario, client, messages, tools)
@@ -133,14 +136,19 @@ async def run_scenario(
             if log:
                 print(f"[{scenario.id}] turn {index:>2} ABORTED: {abort_reason}", flush=True)
             break
+        if turn.truncate_reply_chars is not None:
+            _truncate_last_reply(messages, turn.truncate_reply_chars)
         # A growing transcript must report a growing prompt load. A drop means
         # the backend silently truncated: the true size exceeded its window,
         # so under honest stop-at-limit semantics this turn would have failed.
         # wall_mode "exceed" disables this heuristic — REQUIRED for middleware
         # runs, where the system under test legitimately shrinks the context.
+        # A rewind turn legitimately shrinks the transcript, so the heuristic
+        # resets there instead of firing.
         truncation_detected = (
             wall_mode == "strict"
             and not isinstance(client, MockClient)
+            and not turn.rewind_user_turns
             and record.prompt_tokens < previous_load
         )
         if wall is not None and (record.prompt_tokens > wall or truncation_detected):
@@ -159,7 +167,9 @@ async def run_scenario(
             break
         previous_load = record.prompt_tokens
         for check in turn.checks:
-            record.checks.append(await evaluate_check(check, record.reply, judge))
+            record.checks.append(
+                await evaluate_check(check, record.reply, judge, votes=judge_votes)
+            )
         records.append(record)
         if log:
             _log_turn(scenario, record)
@@ -175,6 +185,29 @@ async def run_scenario(
         abort_reason=abort_reason,
         probes_unreached=unreached,
     )
+
+
+def _rewind(messages: list[dict[str, Any]], user_turns: int) -> None:
+    """Cut history back to just before the Nth-most-recent user message.
+
+    This is what chat UIs do when the user edits an earlier message (fork)
+    or hits regenerate: everything from that message on is discarded and the
+    new text is sent in its place.
+    """
+    user_positions = [
+        position for position, message in enumerate(messages) if message.get("role") == "user"
+    ]
+    if not user_positions or user_turns > len(user_positions):
+        raise ValueError(f"cannot rewind {user_turns} user turns in {len(user_positions)}")
+    del messages[user_positions[-user_turns]:]
+
+
+def _truncate_last_reply(messages: list[dict[str, Any]], keep_chars: int) -> None:
+    """Keep only a prefix of the last assistant reply in history (stop button)."""
+    last = messages[-1]
+    content = last.get("content")
+    if last.get("role") == "assistant" and isinstance(content, str) and len(content) > keep_chars:
+        messages[-1] = {"role": "assistant", "content": content[:keep_chars]}
 
 
 def _describe_abort(error: Exception) -> str:

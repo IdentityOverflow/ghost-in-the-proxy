@@ -82,6 +82,17 @@ class Turn:
     # information still enters the stream, and records tool_used=False.
     expects_tool: bool = False
     fallback_tool: str | None = None
+    # Client-side history edits — the behaviors real chat UIs perform that a
+    # middleware must survive (fork/regenerate/interrupt, s7/s8):
+    # rewind_user_turns=N cuts the transcript back to just BEFORE the Nth-
+    # most-recent user message before sending this turn's user text. With
+    # different text that is an edit (fork); with identical text, a
+    # regenerate. N=1 replaces the latest exchange.
+    rewind_user_turns: int = 0
+    # truncate_reply_chars=N keeps only the first N characters of this
+    # turn's reply in the transcript afterwards — the client stop button.
+    # The full reply is still recorded and graded; only history is cut.
+    truncate_reply_chars: int | None = None
     # Optional canned assistant reply used by `--mock` plumbing self-tests.
     mock_reply: str | None = None
     note: str = ""

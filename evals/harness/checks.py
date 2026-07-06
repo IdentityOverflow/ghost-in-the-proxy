@@ -61,6 +61,7 @@ async def evaluate_check(
     check: Check,
     reply: str,
     judge: JudgeClient | None,
+    votes: int = 1,
 ) -> CheckResult:
     if check.kind == "must_mention":
         hit = _match_any(check.patterns, reply)
@@ -79,9 +80,28 @@ async def evaluate_check(
     if check.kind == "judge":
         if judge is None:
             return CheckResult(check.kind, check.desc, "skipped", "no judge configured")
-        return await _run_judge(check, reply, judge)
+        return await _run_judge_votes(check, reply, judge, votes)
 
     return CheckResult(check.kind, check.desc, "error", f"unknown check kind {check.kind}")
+
+
+async def _run_judge_votes(
+    check: Check, reply: str, judge: JudgeClient, votes: int
+) -> CheckResult:
+    """Majority-of-N judging: borderline rubrics flip verdicts between single
+    judgings of the SAME reply (observed live on s6-t12); an odd vote count
+    turns that coin-flip into a stable decision. votes=1 is the plain path."""
+    results = [await _run_judge(check, reply, judge) for _ in range(max(1, votes))]
+    decided = [result for result in results if result.status in ("pass", "fail")]
+    if not decided:
+        return results[0]
+    passes = sum(1 for result in decided if result.status == "pass")
+    fails = len(decided) - passes
+    majority = "pass" if passes > fails else "fail"
+    winner = next(result for result in decided if result.status == majority)
+    if len(results) > 1:
+        winner.detail = f"[{passes}/{len(decided)} votes pass] {winner.detail}"
+    return winner
 
 
 async def _run_judge(check: Check, reply: str, judge: JudgeClient) -> CheckResult:

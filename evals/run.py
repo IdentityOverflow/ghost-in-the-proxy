@@ -49,6 +49,12 @@ def parse_args() -> argparse.Namespace:
         "exceed: only abort past the wall — required for middleware runs, which shrink context",
     )
     parser.add_argument("--judge-model", default=None)
+    parser.add_argument(
+        "--judge-votes",
+        type=int,
+        default=1,
+        help="majority-of-N judging for judge checks (odd N; stabilizes borderline rubrics)",
+    )
     parser.add_argument("--judge-base-url", default=None, help="defaults to --base-url")
     parser.add_argument(
         "--judge-codex",
@@ -99,7 +105,12 @@ async def main() -> None:
                 print(f"\n=== {scenario.id}: {scenario.title} ({len(scenario.turns)} turns) ===", flush=True)
                 results.append(
                     await run_scenario(
-                        scenario, client, judge=judge, wall=args.wall, wall_mode=args.wall_mode
+                        scenario,
+                        client,
+                        judge=judge,
+                        wall=args.wall,
+                        wall_mode=args.wall_mode,
+                        judge_votes=args.judge_votes,
                     )
                 )
         finally:
@@ -113,6 +124,7 @@ async def main() -> None:
         "temperature": args.temperature,
         "wall": args.wall,
         "wall_mode": args.wall_mode,
+        "judge_votes": args.judge_votes,
         "note": args.note,
         "date": datetime.now().isoformat(timespec="seconds"),
     }

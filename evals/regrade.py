@@ -27,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Re-grade a stored eval run.")
     parser.add_argument("results_dir", help="run directory containing results.json")
     parser.add_argument("--judge-model", default=None)
+    parser.add_argument("--judge-votes", type=int, default=1)
     parser.add_argument("--judge-base-url", default="http://localhost:11434/v1")
     parser.add_argument(
         "--judge-codex",
@@ -81,7 +82,9 @@ async def main() -> None:
                 if aborted_at is None or record.index < aborted_at:
                     turn_def = scenario.turns[record.index - 1]
                     for check in turn_def.checks:
-                        record.checks.append(await evaluate_check(check, record.reply, judge))
+                        record.checks.append(
+                            await evaluate_check(check, record.reply, judge, votes=args.judge_votes)
+                        )
                 records.append(record)
             result = ScenarioResult(
                 scenario_id=stored_scenario["scenario_id"],
