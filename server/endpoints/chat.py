@@ -41,8 +41,17 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             outgoing_messages = prepared.messages
             session_id = prepared.session_id
             if prepared.tools_scoped:
-                if prepared.tools:
-                    payload["tools"] = prepared.tools
+                tools_out = prepared.tools or []
+                if req.stream:
+                    # Recall interception exists only in the non-stream path;
+                    # offering it on a stream would leak an unknown tool call
+                    # to the client mid-stream.
+                    tools_out = [
+                        t for t in tools_out
+                        if t.get("function", {}).get("name") != "recall"
+                    ]
+                if tools_out:
+                    payload["tools"] = tools_out
                 else:
                     payload.pop("tools", None)
         except Exception as error:
