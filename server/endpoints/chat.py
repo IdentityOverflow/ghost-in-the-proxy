@@ -27,20 +27,29 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     agent_state = agent_graph.invoke({"messages": messages_dict})
     outgoing_messages = agent_state["messages"]
 
-    # Mind middleware: replace the transcript with an assembled workspace.
+    payload = req.model_dump(exclude_none=True)
+
+    # Mind middleware: replace the transcript with an assembled workspace,
+    # scope the client's tool pack, and offer the recall tool (v3).
     mind = get_mind_runtime()
     session_id: str | None = None
     if mind is not None:
         try:
-            prepared = await mind.prepare(outgoing_messages, provider, req.model)
+            prepared = await mind.prepare(
+                outgoing_messages, provider, req.model, tools=payload.get("tools")
+            )
             outgoing_messages = prepared.messages
             session_id = prepared.session_id
+            if prepared.tools_scoped:
+                if prepared.tools:
+                    payload["tools"] = prepared.tools
+                else:
+                    payload.pop("tools", None)
         except Exception as error:
             if mind_config.fail_mode == "strict":
                 raise HTTPException(500, f"mind failure (strict mode): {error}") from error
             print(f"[mind] ERROR, falling back to passthrough: {error!r}", flush=True)
 
-    payload = req.model_dump(exclude_none=True)
     payload["messages"] = outgoing_messages
     if target_model:
         payload["model"] = target_model
@@ -70,6 +79,40 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
     try:
         resp = await provider.chat_completions(payload)
+        # Recall interception (v3): recall is OUR tool, invisible to the
+        # client. Resolve it proxy-side and re-query; the exchange never
+        # enters the event store (the client's next transcript won't contain
+        # it — recording it would desync reconciliation). Mixed calls
+        # (recall + client tools) pass through untouched: partially executing
+        # a tool batch would leave the client with dangling call ids.
+        hops = 0
+        while mind is not None and session_id is not None and mind_config.recall_enabled:
+            message = resp["choices"][0]["message"]
+            calls = message.get("tool_calls") or []
+            recall_calls = [c for c in calls if c.get("function", {}).get("name") == "recall"]
+            if not calls or len(recall_calls) != len(calls):
+                if recall_calls:
+                    print("[mind] mixed recall+client tool_calls; passing through", flush=True)
+                break
+            if hops >= mind_config.recall_max_hops:
+                print("[mind] recall hop limit reached; passing through", flush=True)
+                break
+            hops += 1
+            followup = list(payload["messages"]) + [message]
+            for call in recall_calls:
+                content = mind.resolve_recall(
+                    session_id, call.get("function", {}).get("arguments") or "{}"
+                )
+                followup.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.get("id", f"recall-{hops}"),
+                        "content": content,
+                    }
+                )
+            print(f"[mind] recall hop {hops}: {len(recall_calls)} call(s)", flush=True)
+            payload = {**payload, "messages": followup}
+            resp = await provider.chat_completions(payload)
     except httpx.HTTPStatusError as error:
         # Mirror backend errors (status + body) instead of collapsing them
         # into an opaque proxy 500; clients rely on e.g. context-length 400s.

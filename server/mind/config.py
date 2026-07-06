@@ -27,6 +27,13 @@ class MindConfig(BaseModel):
     steward_input_tokens: int = int(os.getenv("MIND_STEWARD_INPUT_TOKENS", "2600"))
     # Model used for summarization/extraction; empty = the request's model.
     extraction_model: str | None = os.getenv("MIND_EXTRACTION_MODEL") or None
+    # v3: offer the model a `recall` tool over the raw event store once
+    # material has folded out of view (the provenance escape hatch).
+    recall_enabled: bool = os.getenv("MIND_RECALL", "1") == "1"
+    # Max proxy-side recall round-trips per request.
+    recall_max_hops: int = int(os.getenv("MIND_RECALL_MAX_HOPS", "3"))
+    # v3: scope the client's tool pack per turn (schema bulk is context tax).
+    tool_router_enabled: bool = os.getenv("MIND_TOOL_ROUTER", "1") == "1"
     # "open": mind errors fall back to passthrough (production posture).
     # "strict": mind errors fail the request loudly — REQUIRED for eval runs,
     # otherwise a crashed mind silently gets graded as the passthrough.

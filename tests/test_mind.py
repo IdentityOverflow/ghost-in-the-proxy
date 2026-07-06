@@ -452,3 +452,99 @@ def test_steward_chunks_oversized_folds(store):
     episodes = store.live_episodes(sid)
     assert len(episodes) == len(calls)
     assert episodes[-1][1] == 12  # watermark reached the requested boundary
+
+
+# -- v3: recall + tool router -------------------------------------------------
+
+
+TOOLBELT = [
+    {"type": "function", "function": {"name": f"tool_{i}", "description": f"does thing {i}"}}
+    for i in range(8)
+]
+
+
+def test_router_prunes_chat_turns_and_keeps_tool_turns(store):
+    from server.mind.router import scope_tools
+
+    sid = store.create_session(None)
+    store.append_event(sid, user("hello"), source="client")
+    events = store.live_events(sid)
+
+    # Chat turn: full belt pruned to nothing.
+    assert scope_tools(TOOLBELT, events, "what's a good patch-day order?") == []
+    # Imperative probe verb: full belt forwarded.
+    assert scope_tools(TOOLBELT, events, "Check the containers please") == TOOLBELT
+    assert scope_tools(TOOLBELT, events, "Find out what's eating the space") == TOOLBELT
+    # Explicit tool-name mention selects just that tool.
+    named = scope_tools(TOOLBELT, events, "use tool 3 on it")
+    assert [t["function"]["name"] for t in named] == ["tool_3"]
+    # Small packs are never pruned.
+    assert scope_tools(TOOLBELT[:2], events, "chit chat") == TOOLBELT[:2]
+
+
+def test_router_keeps_belt_while_tools_in_flight(store):
+    from server.mind.router import scope_tools
+
+    sid = store.create_session(None)
+    store.append_event(sid, user("check it"), source="client")
+    store.append_event(
+        sid,
+        {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+            "function": {"name": "tool_1", "arguments": "{}"}}]},
+        source="mind",
+    )
+    store.append_event(sid, {"role": "tool", "tool_call_id": "c1", "content": "out"}, source="client")
+    events = store.live_events(sid)
+    # Follow-up turn right after tool traffic: model may need the belt again.
+    assert scope_tools(TOOLBELT, events, "hmm, and what does that mean?") == TOOLBELT
+
+
+def test_recall_returns_verbatim_span(store):
+    import json as _json
+
+    from server.mind.recall import resolve_recall
+
+    sid = store.create_session(None)
+    traceback = (
+        "Traceback (most recent call last):\n  File \"ingest.py\", line 214\n"
+        "sqlite3.OperationalError: no such column: photos.review_flag_v2 [ref: ingest-9f4c2e71]"
+    )
+    store.append_event(sid, user("my app broke:\n" + traceback), source="client")
+    store.append_event(sid, assistant("the migration didn't apply"), source="mind")
+    for i in range(6):
+        store.append_event(sid, user(f"unrelated question {i} about the garden"), source="client")
+        store.append_event(sid, assistant(f"answer {i}"), source="mind")
+    events = store.live_events(sid)
+
+    out = resolve_recall(events, _json.dumps({"query": "traceback review_flag error line"}))
+    assert "photos.review_flag_v2 [ref: ingest-9f4c2e71]" in out  # verbatim
+    assert "[seq 1, user, verbatim]" in out                       # provenance
+    assert "recall error" in resolve_recall(events, "{}")
+    assert "nothing found" in resolve_recall(events, '{"query": "xylophone zeppelin"}')
+
+
+def test_prepare_scopes_tools_and_offers_recall(store, tmp_path):
+    import asyncio
+
+    from server.mind.runtime import MindRuntime
+
+    cfg = config(db_dir=str(tmp_path / "minds"))
+    runtime = MindRuntime(cfg)
+
+    async def go():
+        transcript = [user("let's plan the garden layout")]
+        prepared = await runtime.prepare(transcript, provider=None, model="m", tools=TOOLBELT)
+        # Chat turn: tools pruned; no fold yet -> no recall offered.
+        assert prepared.tools_scoped and prepared.tools == []
+
+        # Simulate folded material: summary watermark present.
+        runtime.store.append_event(prepared.session_id, assistant("plan drafted"), source="mind")
+        runtime.store.append_summary(prepared.session_id, 1, "earlier stuff")
+        transcript += [assistant("plan drafted"), user("now check the beds status")]
+        prepared2 = await runtime.prepare(transcript, provider=None, model="m", tools=TOOLBELT)
+        names = [t["function"]["name"] for t in prepared2.tools]
+        assert "recall" in names            # offered once memory is folded
+        assert "tool_0" in names            # probe verb "check" keeps the belt
+        assert prepared2.session_id == prepared.session_id
+
+    asyncio.run(go())

@@ -25,6 +25,8 @@ from .assembler import ThreadsView, Workspace, assemble, estimate_tokens
 from .config import MindConfig, mind_config
 from .dynamics import ThreadState, admitted_threads, cued_threads, update_dynamics
 from .perception import reconcile
+from .recall import RECALL_TOOL, resolve_recall
+from .router import scope_tools
 from .steward import run_steward
 from .store import MindStore
 from .summarizer import update_summary
@@ -35,6 +37,10 @@ class PreparedRequest:
     session_id: str
     outcome: str
     messages: list[dict[str, Any]]
+    # Tools to forward this request (router-scoped client tools + recall).
+    # None means "leave the client's tools untouched".
+    tools: list[dict[str, Any]] | None = None
+    tools_scoped: bool = False
 
 
 class MindRuntime:
@@ -48,6 +54,7 @@ class MindRuntime:
         messages: list[dict[str, Any]],
         provider: Any,
         model: str,
+        tools: list[dict[str, Any]] | None = None,
     ) -> PreparedRequest:
         recon = reconcile(self.store, messages)
         events = self.store.live_events(recon.session_id)
@@ -84,12 +91,39 @@ class MindRuntime:
                 self.config, client_system, events, summary, records, episodes, threads
             )
 
+        # v3 routing: scope the client's tool pack to this turn, and offer
+        # recall once anything has folded out of verbatim view.
+        last_user_text = next(
+            (
+                event.message.get("content")
+                for event in reversed(events)
+                if event.role == "user" and isinstance(event.message.get("content"), str)
+            ),
+            "",
+        )
+        scoped = tools
+        tools_scoped = False
+        if self.config.tool_router_enabled and tools:
+            scoped = scope_tools(tools, events, last_user_text)
+            tools_scoped = scoped is not tools
+        out_tools = list(scoped) if scoped else []
+        folded_upto = (summary or (0, ""))[0]
+        recall_offered = self.config.recall_enabled and folded_upto > 0
+        if recall_offered:
+            out_tools = out_tools + [RECALL_TOOL]
+            tools_scoped = True
+
         print(
             "[mind]",
             json.dumps(
                 {
                     "session": recon.session_id,
                     "outcome": recon.outcome,
+                    "tools": {
+                        "client": len(tools or []),
+                        "forwarded": len(scoped or []),
+                        "recall": recall_offered,
+                    },
                     "live_events": len(events),
                     "workspace_tokens_est": workspace.estimated_tokens,
                     "texture_from_seq": workspace.texture_from_seq,
@@ -110,7 +144,16 @@ class MindRuntime:
             ),
             flush=True,
         )
-        return PreparedRequest(recon.session_id, recon.outcome, workspace.messages)
+        return PreparedRequest(
+            recon.session_id,
+            recon.outcome,
+            workspace.messages,
+            tools=out_tools if tools_scoped else None,
+            tools_scoped=tools_scoped,
+        )
+
+    def resolve_recall(self, session_id: str, arguments_json: str) -> str:
+        return resolve_recall(self.store.live_events(session_id), arguments_json)
 
     def observe_reply(
         self, session_id: str, message: dict[str, Any], complete: bool = True
