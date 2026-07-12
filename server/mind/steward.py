@@ -12,6 +12,7 @@ must degrade to the previous working mind, never to nothing.
 
 import json
 import re
+from datetime import datetime
 from typing import Any
 
 from .assembler import estimate_tokens
@@ -32,7 +33,7 @@ memory and new conversation turns, output the COMPLETE UPDATED memory as JSON, n
     {"topic": "<short key>", "status": "decided" | "leaning" | "open", "choice": "<what>", "reason": "<why, if given>"}
   ],
   "commitments": [
-    {"actor": "user" | "assistant", "statement": "<what was promised>", "trigger": "<when it should fire>", "status": "open" | "done" | "dropped"}
+    {"actor": "user" | "assistant", "statement": "<what was promised>", "trigger": "<when it should fire>", "due": "<ISO 8601 local datetime (YYYY-MM-DDTHH:MM) when the trigger is a point in time, else null>", "status": "open" | "done" | "dropped"}
   ],
   "episode": "<2-3 sentence narrative of what happened in the new turns, including distinctive one-off details and asides>"
 }
@@ -43,6 +44,7 @@ Rules:
 - "decided" only when explicitly settled. NEVER upgrade a leaning to decided on your own.
 - Commitments are promises to act LATER (with a trigger or deadline), or standing requests to track something. A request the assistant fulfilled immediately in the same turn is NOT a commitment — do not record it.
 - When the user says "remind me to X", "don't let me forget X", or "before we ship, X" — that is an OPEN commitment; record it verbatim with its trigger.
+- When a trigger is a time ("in two hours", "at 6pm", "tomorrow morning"), compute the absolute datetime FROM THE TIMESTAMP OF THE MESSAGE that set it and record it in "due". Event-only triggers ("when we deploy") get due: null. Never change an existing commitment's due.
 - Corrections replace the fact's claim; note the superseded value inside the claim (e.g. "9090 (was 8080, port collision)").
 - Record distinctive one-off details and personal asides as facts, even if they seem irrelevant.
 - Keep numbers, names, and file paths exact. Never invent entries.
@@ -61,6 +63,7 @@ async def run_steward(
     provider: Any,
     model: str,
     upto_seq: int,
+    now: float | None = None,
 ) -> None:
     """Fold events up to upto_seq into the ledger and an episode line.
 
@@ -74,7 +77,7 @@ async def run_steward(
     if not fold:
         return
     for chunk in _chunks(fold, config.steward_input_tokens):
-        await _fold_pass(config, store, session_id, chunk, provider, model)
+        await _fold_pass(config, store, session_id, chunk, provider, model, now)
 
 
 def _chunks(fold: list[Event], cap_tokens: int) -> list[list[Event]]:
@@ -97,6 +100,7 @@ async def _fold_pass(
     fold: list[Event],
     provider: Any,
     model: str,
+    now: float | None = None,
 ) -> None:
     upto_seq = fold[-1].seq
     ledger = store.live_records(session_id)
@@ -110,7 +114,12 @@ async def _fold_pass(
         ensure_ascii=False,
         indent=1,
     )
-    transcript = "\n".join(f"[{event.role}] {_flatten(event.message)}" for event in fold)
+    transcript = "\n".join(
+        f"[{event.role}{_stamp(event, now)}] {_flatten(event.message)}" for event in fold
+    )
+    clock_line = ""
+    if now is not None:
+        clock_line = f"Current datetime: {datetime.fromtimestamp(now).isoformat(timespec='minutes')}\n\n"
 
     payload = {
         "model": config.extraction_model or model,
@@ -119,6 +128,7 @@ async def _fold_pass(
             {
                 "role": "user",
                 "content": (
+                    f"{clock_line}"
                     f"Current memory:\n{current_memory}\n\n"
                     f"New turns:\n{transcript}\n\n"
                     "Complete updated memory (JSON only):"
@@ -127,6 +137,7 @@ async def _fold_pass(
         ],
         "temperature": 0.1,
         "stream": False,
+        "max_tokens": config.extraction_max_tokens,
     }
     response = await provider.chat_completions(payload)
     content = response["choices"][0]["message"].get("content") or ""
@@ -169,6 +180,14 @@ def _parse_proposal(content: str) -> dict[str, Any]:
         if not isinstance(data.get(key, []), list):
             raise StewardParseError(f"steward field {key} is not a list")
     return data
+
+
+def _stamp(event: Event, now: float | None) -> str:
+    """Per-line timestamp so the steward can compute absolute due datetimes
+    from relative triggers. Only rendered when the mind has a clock."""
+    if now is None or not event.ts:
+        return ""
+    return " " + datetime.fromtimestamp(event.ts).isoformat(timespec="minutes")
 
 
 def _flatten(message: dict[str, Any]) -> str:

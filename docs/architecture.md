@@ -195,9 +195,21 @@ what the client retained.
 | **v1 stores** | steward extraction, semantic + commitments + episodes, assembler uses them | **≥76% @8k, flat tokens** (s1 3/3, s6 t12, s4 stays 4/4); conversational scenarios ≥ baseline-8k *at 4k* |
 | **v2 dynamics** | CRS thread activations, decay, question attractors, idle reflection | s5 pair holds with *smaller* mean workspace; no regressions; retrieval hit-rate up |
 | **v3 routing/workers** | router, scoped tool packs, contained workers, `recall` tool | s2 completes @8k with synthesis probe attempted; s6 curve flat after dump |
+| **v4 chronos** | wall-clock time as a first-class input (`MIND_TIME`): event timestamps read back, current time + elapsed-gap markers rendered, steward converts relative triggers to absolute `due` datetimes, OVERDUE surfaces on return | s11 duration + time-of-day probes pass; v3 and baseline fail them identically (no clock anywhere); no 8k regression |
 
 The s2 synthesis probe doubles as a leak detector throughout: if it starts
 passing before v3's worker route exists, the harness is leaking hints.
+
+v4 is the first phase where the mind diverges from what any transcript
+could carry: the client protocol transmits no clock, so a transcript-stuffing
+baseline *cannot* know how long the user was away — only a mind with its own
+timeline can. Eval support: the harness advances a virtual clock per turn
+(`Turn.advance_clock_s`) sent as an `X-Mind-Clock` header, honored only when
+`MIND_FAKE_CLOCK=1`. Deliberately out of v4 scope (tier 2/3, planned as the
+repurposed-MDCS custom client): the idle reflection loop acting *between*
+requests, agenda records, and true proactive push — an OpenAI-compatible
+proxy cannot initiate messages, so proactivity through standard clients
+surfaces at next contact.
 
 ## Design decisions (settled 2026-07-05)
 

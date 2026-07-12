@@ -68,7 +68,11 @@ def _score_match(events: list[Event], incoming: list[dict[str, Any]]) -> tuple[i
     return matched, last_kind
 
 
-def reconcile(store: MindStore, messages: list[dict[str, Any]]) -> Reconciliation:
+def reconcile(
+    store: MindStore, messages: list[dict[str, Any]], now: float | None = None
+) -> Reconciliation:
+    """`now` stamps ingested events with an explicit wall-clock time (fake-clock
+    eval runs); None lets the store default to the real clock."""
     client_system, incoming = _split_system(messages)
 
     best: tuple[int, str, str, list[Event]] | None = None  # matched, kind, session, events
@@ -93,11 +97,13 @@ def reconcile(store: MindStore, messages: list[dict[str, Any]]) -> Reconciliatio
             # record with the truncation the client actually saw.
             truncated_at = events[matched - 1].seq
             replacement = incoming[matched - 1]
-            new_seq = store.append_event(session_id, replacement, source="client", confirmed=True)
+            new_seq = store.append_event(
+                session_id, replacement, source="client", confirmed=True, ts=now
+            )
             store.supersede_from(session_id, truncated_at, new_seq)
             # Everything the store had after the truncation point is gone
             # from the client's world; re-ingest their tail as truth.
-            _ingest(store, session_id, incoming[matched:])
+            _ingest(store, session_id, incoming[matched:], now)
             store.set_client_system(session_id, client_system)
             return Reconciliation(session_id, "truncation", incoming[matched:])
         if not diverged and matched == len(events):
@@ -106,7 +112,7 @@ def reconcile(store: MindStore, messages: list[dict[str, Any]]) -> Reconciliatio
                 if not event.confirmed:
                     store.confirm_event(session_id, event.seq)
             new = incoming[matched:]
-            _ingest(store, session_id, new)
+            _ingest(store, session_id, new, now)
             store.set_client_system(session_id, client_system)
             return Reconciliation(session_id, "continue", new)
         if not diverged and matched == len(incoming) and matched >= 2:
@@ -131,17 +137,24 @@ def reconcile(store: MindStore, messages: list[dict[str, Any]]) -> Reconciliatio
             fork_seq = events[matched].seq
             tail = incoming[matched:]
             if tail:
-                first_new = store.append_event(session_id, tail[0], source="client", confirmed=True)
+                first_new = store.append_event(
+                    session_id, tail[0], source="client", confirmed=True, ts=now
+                )
                 store.supersede_from(session_id, fork_seq, first_new)
-                _ingest(store, session_id, tail[1:])
+                _ingest(store, session_id, tail[1:], now)
             store.set_client_system(session_id, client_system)
             return Reconciliation(session_id, "fork", tail)
 
     session_id = store.create_session(client_system)
-    _ingest(store, session_id, incoming)
+    _ingest(store, session_id, incoming, now)
     return Reconciliation(session_id, "new", incoming)
 
 
-def _ingest(store: MindStore, session_id: str, messages: list[dict[str, Any]]) -> None:
+def _ingest(
+    store: MindStore,
+    session_id: str,
+    messages: list[dict[str, Any]],
+    now: float | None = None,
+) -> None:
     for message in messages:
-        store.append_event(session_id, message, source="client", confirmed=True)
+        store.append_event(session_id, message, source="client", confirmed=True, ts=now)

@@ -106,6 +106,7 @@ class Event:
     source: str
     complete: bool
     confirmed: bool
+    ts: float = 0.0  # wall-clock unix seconds (v4 chronos)
 
 
 class MindStore:
@@ -148,7 +149,7 @@ class MindStore:
 
     def live_events(self, session_id: str) -> list[Event]:
         rows = self._conn.execute(
-            "SELECT seq, role, content, source, complete, confirmed FROM events"
+            "SELECT seq, role, content, source, complete, confirmed, ts FROM events"
             " WHERE session = ? AND superseded_by IS NULL ORDER BY seq",
             (session_id,),
         ).fetchall()
@@ -160,6 +161,7 @@ class MindStore:
                 source=row[3],
                 complete=bool(row[4]),
                 confirmed=bool(row[5]),
+                ts=row[6] or 0.0,
             )
             for row in rows
         ]
@@ -171,25 +173,43 @@ class MindStore:
         source: str,
         complete: bool = True,
         confirmed: bool = False,
+        ts: float | None = None,
     ) -> int:
+        """ts overrides the wall clock (fake-clock eval runs); None = real now."""
         with self._lock, self._conn:
             row = self._conn.execute(
                 "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session = ?", (session_id,)
             ).fetchone()
             seq = row[0] + 1
-            self._conn.execute(
-                "INSERT INTO events (session, seq, role, content, source, complete, confirmed)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    session_id,
-                    seq,
-                    message.get("role", ""),
-                    normalize_message(message),
-                    source,
-                    int(complete),
-                    int(confirmed),
-                ),
-            )
+            if ts is None:
+                self._conn.execute(
+                    "INSERT INTO events (session, seq, role, content, source, complete, confirmed)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        session_id,
+                        seq,
+                        message.get("role", ""),
+                        normalize_message(message),
+                        source,
+                        int(complete),
+                        int(confirmed),
+                    ),
+                )
+            else:
+                self._conn.execute(
+                    "INSERT INTO events (session, seq, role, content, source, complete, confirmed, ts)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        session_id,
+                        seq,
+                        message.get("role", ""),
+                        normalize_message(message),
+                        source,
+                        int(complete),
+                        int(confirmed),
+                        ts,
+                    ),
+                )
         return seq
 
     def next_seq(self, session_id: str) -> int:

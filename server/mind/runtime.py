@@ -12,6 +12,7 @@ MIND_FAIL_MODE=strict -> mind errors raise; eval runs MUST use strict, or a
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -55,8 +56,15 @@ class MindRuntime:
         provider: Any,
         model: str,
         tools: list[dict[str, Any]] | None = None,
+        now: float | None = None,
     ) -> PreparedRequest:
-        recon = reconcile(self.store, messages)
+        """`now` is a client-supplied clock (X-Mind-Clock, fake-clock eval runs
+        only); None means the real wall clock."""
+        recon = reconcile(self.store, messages, now=now)
+        # Chronos (v4): the time the mind renders and reasons with. None keeps
+        # every time-aware surface (Now section, gap markers, due status,
+        # steward timestamps) inert.
+        clock = (now if now is not None else time.time()) if self.config.time_enabled else None
         events = self.store.live_events(recon.session_id)
         client_system = self.store.get_client_system(recon.session_id)
         summary = self.store.latest_summary(recon.session_id)
@@ -65,7 +73,7 @@ class MindRuntime:
 
         threads = self._attention(recon.session_id, events, records)
         workspace = assemble(
-            self.config, client_system, events, summary, records, episodes, threads
+            self.config, client_system, events, summary, records, episodes, threads, now=clock
         )
         uncovered = self._uncovered_tokens(events, summary, workspace)
         if uncovered > self.config.summary_trigger_tokens:
@@ -76,7 +84,8 @@ class MindRuntime:
             upto = self._fold_boundary(events, workspace.desired_from_seq - 1)
             try:
                 await run_steward(
-                    self.config, self.store, recon.session_id, events, provider, model, upto
+                    self.config, self.store, recon.session_id, events, provider, model, upto,
+                    now=clock,
                 )
             except Exception as error:
                 print(f"[mind] steward failed ({error!r}); prose fallback", flush=True)
@@ -88,7 +97,7 @@ class MindRuntime:
             episodes = self.store.live_episodes(recon.session_id)
             threads = self._attention(recon.session_id, events, records)
             workspace = assemble(
-                self.config, client_system, events, summary, records, episodes, threads
+                self.config, client_system, events, summary, records, episodes, threads, now=clock
             )
 
         # v3 routing: scope the client's tool pack to this turn, and offer
@@ -156,7 +165,11 @@ class MindRuntime:
         return resolve_recall(self.store.live_events(session_id), arguments_json)
 
     def observe_reply(
-        self, session_id: str, message: dict[str, Any], complete: bool = True
+        self,
+        session_id: str,
+        message: dict[str, Any],
+        complete: bool = True,
+        ts: float | None = None,
     ) -> None:
         """Record our own reply as a provisional event (confirmed next request)."""
         keep = {
@@ -167,7 +180,7 @@ class MindRuntime:
         if isinstance(keep.get("content"), str):
             keep["content"] = THINK_BLOCK.sub("", keep["content"])
         self.store.append_event(
-            session_id, keep, source="mind", complete=complete, confirmed=False
+            session_id, keep, source="mind", complete=complete, confirmed=False, ts=ts
         )
 
     def _attention(

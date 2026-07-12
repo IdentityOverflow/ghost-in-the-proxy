@@ -27,6 +27,11 @@ class MindConfig(BaseModel):
     steward_input_tokens: int = int(os.getenv("MIND_STEWARD_INPUT_TOKENS", "2600"))
     # Model used for summarization/extraction; empty = the request's model.
     extraction_model: str | None = os.getenv("MIND_EXTRACTION_MODEL") or None
+    # Hard cap on extraction-call output (steward/summarizer). Roomy enough
+    # for reasoning-mode think + the JSON (measured ~1.4k on gemma-4-qat);
+    # an uncapped call was observed to stall LM Studio for 8+ minutes, and a
+    # truncated proposal just falls back through StewardParseError.
+    extraction_max_tokens: int = int(os.getenv("MIND_EXTRACTION_MAX_TOKENS", "4000"))
     # v3: offer the model a `recall` tool over the raw event store once
     # material has folded out of view (the provenance escape hatch).
     recall_enabled: bool = os.getenv("MIND_RECALL", "1") == "1"
@@ -38,6 +43,16 @@ class MindConfig(BaseModel):
     # this many characters in the workspace (full text stays in the event
     # store; recall reaches it). 0 disables digestion.
     tool_digest_chars: int = int(os.getenv("MIND_TOOL_DIGEST_CHARS", "700"))
+    # v4 chronos: render real time into the workspace — current time, elapsed
+    # gaps between turns, and due/overdue status on time-triggered commitments.
+    time_enabled: bool = os.getenv("MIND_TIME", "1") == "1"
+    # Mark elapsed time in the texture when the gap between two turns exceeds
+    # this many minutes.
+    gap_mark_minutes: int = int(os.getenv("MIND_GAP_MARK_MINUTES", "30"))
+    # Honor the X-Mind-Clock request header (unix seconds) as the current
+    # time — eval harness only; never enable in production, or clients could
+    # spoof the mind's clock.
+    fake_clock: bool = os.getenv("MIND_FAKE_CLOCK", "0") == "1"
     # "open": mind errors fall back to passthrough (production posture).
     # "strict": mind errors fail the request loudly — REQUIRED for eval runs,
     # otherwise a crashed mind silently gets graded as the passthrough.

@@ -16,6 +16,7 @@ It measurably improves small models at small windows — the founding result: ge
 | **Workspace assembler** | Builds the model's context in fixed order — client system prompt, memory sections with true status labels, recent turns verbatim — under a hard budget (~25% reserve, flat curve). Abundance causes dilution; the scene stays small on purpose. |
 | **Recall** | The provenance escape hatch: a proxy-side tool over the raw event store. When the model needs exact wording that folded away, it reaches back and gets the verbatim span. Invisible to the client. |
 | **Router + containment** | The client's tool belt is scoped per turn (schema bulk is context tax), and stale tool payloads compress to digests under budget pressure — verbatim first, recall always available. |
+| **Chronos** | Wall-clock time as a first-class input: the workspace carries the current time, real elapsed-time markers between turns ("[4 hours pass — it is now …]"), and due/OVERDUE status on time-triggered commitments — the steward converts "in two hours" to an absolute datetime at extraction. A transcript cannot carry any of this: the client protocol transmits no clock. |
 
 Everything derived is append-only and provenance-stamped; corrections are supersede links. State at any point in the conversation is a query, which is what makes fork/regenerate/interrupt a reconciliation step instead of a feature.
 
@@ -23,7 +24,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the full design and the p
 
 ## The eval suite
 
-`evals/` contains a 10-scenario harness that plays scripted multi-turn conversations as a real client (full transcript resent every turn) against any OpenAI-compatible endpoint, and grades probes deterministically plus with an optional LLM judge (majority-of-N voting). Scenarios cover decision coherence, tool-heavy synthesis, delayed commitment triggers, contradiction handling, salience decay with cued recall, containment, fork/regenerate continuity, mid-reply interrupts, verbatim recall, and tool-schema tax.
+`evals/` contains an 11-scenario harness that plays scripted multi-turn conversations as a real client (full transcript resent every turn) against any OpenAI-compatible endpoint, and grades probes deterministically plus with an optional LLM judge (majority-of-N voting). Scenarios cover decision coherence, tool-heavy synthesis, delayed commitment triggers, contradiction handling, salience decay with cued recall, containment, fork/regenerate continuity, mid-reply interrupts, verbatim recall, tool-schema tax, and time awareness across real gaps (a virtual clock advances per turn via the `X-Mind-Clock` header, honored only with `MIND_FAKE_CLOCK=1`).
 
 ```bash
 # baseline (direct to your backend)
@@ -54,6 +55,7 @@ Key environment variables (see `server/mind/config.py` for all):
 | `MIND_FAIL_MODE` | `open` | `open` = mind errors fall back to passthrough; `strict` = fail loudly (required for eval runs) |
 | `MIND_EXTRACTION_MODEL` | request model | separate/faster model for steward extraction |
 | `MIND_RECALL` / `MIND_TOOL_ROUTER` | `1` | v3 organs |
+| `MIND_TIME` | `1` | v4 chronos: current time, gap markers, due/overdue commitments |
 | `MIND_DB_DIR` | `var/minds` | SQLite event stores, one mind per session |
 
 ```bash

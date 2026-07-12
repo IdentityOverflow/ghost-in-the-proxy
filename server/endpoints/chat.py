@@ -33,10 +33,20 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # scope the client's tool pack, and offer the recall tool (v3).
     mind = get_mind_runtime()
     session_id: str | None = None
+    # Fake clock (v4 eval harness): trusted only when explicitly enabled,
+    # otherwise clients could spoof the mind's sense of time.
+    clock: float | None = None
+    if mind_config.fake_clock:
+        raw_clock = request.headers.get("x-mind-clock")
+        if raw_clock:
+            try:
+                clock = float(raw_clock)
+            except ValueError:
+                pass
     if mind is not None:
         try:
             prepared = await mind.prepare(
-                outgoing_messages, provider, req.model, tools=payload.get("tools")
+                outgoing_messages, provider, req.model, tools=payload.get("tools"), now=clock
             )
             outgoing_messages = prepared.messages
             session_id = prepared.session_id
@@ -83,7 +93,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 # We are the stream: record exactly what went out, even on
                 # interrupt (complete=False -> provisional truncated reply).
                 if mind is not None and session_id is not None and collector.message():
-                    mind.observe_reply(session_id, collector.message(), complete=complete)
+                    mind.observe_reply(
+                        session_id, collector.message(), complete=complete, ts=clock
+                    )
         return StreamingResponse(sse(), media_type="text/event-stream")
 
     try:
@@ -128,7 +140,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         return JSONResponse(status_code=error.response.status_code, content=_error_body(error))
     if mind is not None and session_id is not None:
         try:
-            mind.observe_reply(session_id, resp["choices"][0]["message"], complete=True)
+            mind.observe_reply(session_id, resp["choices"][0]["message"], complete=True, ts=clock)
         except Exception as error:
             if mind_config.fail_mode == "strict":
                 raise HTTPException(500, f"mind failure (strict mode): {error}") from error

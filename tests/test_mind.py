@@ -619,3 +619,124 @@ def test_no_digestion_without_budget_pressure(store):
     # Everything fits at 8k: the stale payload must stay verbatim (s2-t5's
     # evidence must not be digested when the budget could carry it).
     assert tool_messages and tool_messages[0]["content"] == payload
+
+
+# -- chronos (v4) -----------------------------------------------------------
+
+
+def test_event_ts_roundtrip(store):
+    from datetime import datetime
+
+    session = store.create_session(None)
+    stamp = datetime(2026, 3, 14, 10, 3).timestamp()
+    store.append_event(session, user("fake-clock turn"), source="client", ts=stamp)
+    store.append_event(session, assistant("real-clock reply"), source="mind")
+    events = store.live_events(session)
+    assert events[0].ts == stamp
+    # No explicit ts -> the store's real clock, not zero.
+    assert events[1].ts > stamp
+
+
+def test_reconcile_stamps_fake_clock(store):
+    stamp = 1_700_000_000.0
+    recon = reconcile(store, [user("hello")], now=stamp)
+    events = store.live_events(recon.session_id)
+    assert [event.ts for event in events] == [stamp]
+
+
+def test_format_gap_units():
+    from server.mind.assembler import format_gap
+
+    assert format_gap(120) == "2 minutes"
+    assert format_gap(9000) == "2.5 hours"
+    assert format_gap(14400) == "4 hours"
+    assert format_gap(3 * 86400) == "3 days"
+
+
+def test_gap_marker_rendered_on_user_turn(store):
+    from datetime import datetime
+
+    cfg = config(window=8192)
+    session = store.create_session(None)
+    t0 = datetime(2026, 3, 14, 10, 26).timestamp()
+    store.append_event(session, user("heading to the garden"), source="client", ts=t0)
+    store.append_event(session, assistant("enjoy!"), source="mind", ts=t0)
+    store.append_event(session, user("ok I'm back"), source="client", ts=t0 + 14400)
+    events = store.live_events(session)
+
+    workspace = assemble(cfg, None, events, None, now=t0 + 14400)
+    back = [m for m in workspace.messages if m.get("role") == "user"][-1]
+    assert back["content"].startswith(
+        "[4 hours pass — it is now Saturday 2026-03-14 14:26]\n\n"
+    )
+    # The event store itself is untouched — markers live only in the render.
+    assert store.live_events(session)[-1].message["content"] == "ok I'm back"
+
+
+def test_no_gap_marker_below_threshold(store):
+    cfg = config(window=8192, gap_mark_minutes=30)
+    session = store.create_session(None)
+    store.append_event(session, user("first"), source="client", ts=1000.0)
+    store.append_event(session, assistant("ok"), source="mind", ts=1001.0)
+    store.append_event(session, user("second, five minutes later"), source="client", ts=1300.0)
+    events = store.live_events(session)
+
+    workspace = assemble(cfg, None, events, None, now=1300.0)
+    contents = [m["content"] for m in workspace.messages if m.get("role") == "user"]
+    assert not any(content.startswith("[") for content in contents)
+
+
+def test_now_section_and_due_status():
+    from datetime import datetime
+
+    from server.mind.assembler import render_memory
+
+    now = datetime(2026, 3, 14, 14, 26).timestamp()
+    records = {
+        "commitment": [
+            {
+                "actor": "user",
+                "statement": "punch down the dough",
+                "trigger": "two hours after 10:03",
+                "due": "2026-03-14T12:03",
+                "status": "open",
+            },
+            {
+                "actor": "user",
+                "statement": "water the rhubarb",
+                "trigger": "this evening",
+                "due": "2026-03-14T18:00",
+                "status": "open",
+            },
+        ]
+    }
+    text = render_memory("", records, [], now=now)
+    assert "### Now" in text and "Saturday 2026-03-14 14:26" in text
+    assert "OVERDUE by 2.4 hours" in text and "raise this NOW" in text
+    assert "due Saturday 2026-03-14 18:00 (in 3.6 hours)" in text
+    # Garbage due values degrade to the plain trigger, never crash.
+    records["commitment"][0]["due"] = "when the cows come home"
+    assert "punch down the dough" in render_memory("", records, [], now=now)
+
+
+def test_no_clock_renders_no_time_surfaces():
+    from server.mind.assembler import render_memory
+
+    records = {
+        "commitment": [
+            {"actor": "user", "statement": "x", "due": "2026-03-14T12:03", "status": "open"}
+        ]
+    }
+    text = render_memory("", records, [], now=None)
+    assert "### Now" not in text and "OVERDUE" not in text
+
+
+def test_fresh_session_gets_bare_time_line_not_memory_theater():
+    from datetime import datetime
+
+    from server.mind.assembler import MIND_HEADER, render_memory
+
+    now = datetime(2026, 3, 14, 14, 26).timestamp()
+    text = render_memory("", {}, [], now=now)
+    assert text == "Current time: Saturday 2026-03-14 14:26."
+    assert MIND_HEADER not in text

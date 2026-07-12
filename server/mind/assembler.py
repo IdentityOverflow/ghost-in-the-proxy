@@ -9,6 +9,7 @@ texture — the summarizer guarantees that ordering.
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from .config import MindConfig
@@ -49,6 +50,29 @@ MIND_HEADER = (
 )
 
 
+def format_clock(ts: float) -> str:
+    return datetime.fromtimestamp(ts).strftime("%A %Y-%m-%d %H:%M")
+
+
+def format_gap(seconds: float) -> str:
+    if seconds < 3600:
+        return f"{max(1, round(seconds / 60))} minutes"
+    if seconds < 48 * 3600:
+        hours = seconds / 3600
+        return f"{hours:.1f}".rstrip("0").rstrip(".") + " hours"
+    return f"{seconds / 86400:.1f}".rstrip("0").rstrip(".") + " days"
+
+
+def _parse_due(value: Any) -> float | None:
+    """Steward-proposed due datetimes are ISO strings; garbage parses to None."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).strip()).timestamp()
+    except ValueError:
+        return None
+
+
 DIGEST_NOTICE = (
     "NOTE: some earlier tool outputs below are shown as truncated digests "
     "marked 'folded away'. If your answer depends on the exact content of a "
@@ -62,9 +86,13 @@ def render_memory(
     records: dict[str, list[dict[str, Any]]],
     episodes: list[tuple[int, int, str]],
     threads: ThreadsView | None = None,
+    now: float | None = None,
 ) -> str:
     """Render the structured ledger + episodes (+ prose fallback) as the
-    memory section of the system prompt. Empty sections are omitted."""
+    memory section of the system prompt. Empty sections are omitted. With a
+    clock but no memory yet (fresh session), only a bare time line renders —
+    the memory framing would be a lie on turn one, and noise primes behavior
+    (observed: an s2 model exploring the environment instead of acting)."""
     sections: list[str] = []
     if threads and threads.admitted:
         lines = []
@@ -86,11 +114,21 @@ def render_memory(
     commitments = records.get("commitment", [])
     open_commitments = [c for c in commitments if c.get("status", "open") == "open"]
     if open_commitments:
-        lines = [
-            f"- ({item.get('actor', 'user')}) {item.get('statement')}"
-            + (f" — trigger: {item['trigger']}" if item.get("trigger") else "")
-            for item in open_commitments
-        ]
+        lines = []
+        for item in open_commitments:
+            line = f"- ({item.get('actor', 'user')}) {item.get('statement')}"
+            if item.get("trigger"):
+                line += f" — trigger: {item['trigger']}"
+            due = _parse_due(item.get("due")) if now is not None else None
+            if due is not None:
+                if now >= due:
+                    line += (
+                        f" — was due {format_clock(due)}, OVERDUE by "
+                        f"{format_gap(now - due)}: raise this NOW"
+                    )
+                else:
+                    line += f" — due {format_clock(due)} (in {format_gap(due - now)})"
+            lines.append(line)
         sections.append("### Open commitments (complete list of tracked items)\n" + "\n".join(lines))
     facts = records.get("fact", [])
     if threads is not None:
@@ -118,7 +156,17 @@ def render_memory(
     if summary_text:
         sections.append("### Earlier conversation (condensed)\n" + summary_text)
     if not sections:
-        return ""
+        return f"Current time: {format_clock(now)}." if now is not None else ""
+    if now is not None:
+        sections.insert(
+            0,
+            "### Now\n"
+            f"Current time: {format_clock(now)} — the time AS OF the user's "
+            "latest message (any elapsed-time markers in the conversation are "
+            "already counted into it; never add them on top). Use it for any "
+            "question about time, duration, or how long the user was away, "
+            "and check open commitments' due times against it.",
+        )
     return MIND_HEADER + "\n\n" + "\n\n".join(sections)
 
 
@@ -160,6 +208,7 @@ def assemble(
     records: dict[str, list[dict[str, Any]]] | None = None,
     episodes: list[tuple[int, int, str]] | None = None,
     threads: ThreadsView | None = None,
+    now: float | None = None,
 ) -> Workspace:
     reserve = max(int(config.window * config.reserve_fraction), 1024)
     # chars/4 underestimates real tokenizers by ~20% (measured against
@@ -171,7 +220,7 @@ def assemble(
     if client_system:
         system_parts.append(client_system)
     summary_upto, summary_text = (summary or (0, ""))
-    memory = render_memory(summary_text, records or {}, episodes or [], threads)
+    memory = render_memory(summary_text, records or {}, episodes or [], threads, now=now)
     if memory:
         system_parts.append(memory)
     system_content = "\n\n".join(system_parts)
@@ -195,6 +244,12 @@ def assemble(
         system_content += "\n\n" + DIGEST_NOTICE
         system_cost = estimate_tokens(system_content)
         texture_budget = workspace_budget - system_cost
+
+    # Chronos (v4): real elapsed time between turns renders as an inline
+    # marker on the later user message — no role changes, so chat-template
+    # alternation is untouched.
+    if now is not None:
+        render = _mark_gaps(config, events, render)
 
     blocks = _texture_blocks(events)
 
@@ -253,6 +308,39 @@ def assemble(
         estimated_tokens=system_cost
         + sum(estimate_tokens(render[event.seq]) for event in texture_events),
     )
+
+
+def _mark_gaps(
+    config: MindConfig, events: list[Event], render: dict[int, Any]
+) -> dict[int, Any]:
+    """Prefix user messages with a '[N hours pass]' marker when real wall-clock
+    time elapsed since the previous event. Events without a timestamp (legacy
+    rows) neither get marked nor anchor a gap."""
+    threshold = config.gap_mark_minutes * 60
+    if threshold <= 0:
+        return render
+    previous_ts: float | None = None
+    for event in events:
+        if not event.ts:
+            continue
+        if (
+            previous_ts is not None
+            and event.role == "user"
+            and event.ts - previous_ts >= threshold
+        ):
+            message = render[event.seq]
+            content = message.get("content")
+            if isinstance(content, str):
+                # The marker pins the absolute arrival time, so the model
+                # never has to add the gap to anything itself (gemma-12B
+                # added it to the header's current time when it had to).
+                marker = (
+                    f"[{format_gap(event.ts - previous_ts)} pass — "
+                    f"it is now {format_clock(event.ts)}]"
+                )
+                render[event.seq] = {**message, "content": f"{marker}\n\n{content}"}
+        previous_ts = event.ts
+    return render
 
 
 def _digest_stale_tool_events(config: MindConfig, events: list[Event]) -> dict[int, Any]:
