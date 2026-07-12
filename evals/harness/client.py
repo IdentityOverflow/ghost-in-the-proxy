@@ -34,6 +34,10 @@ class ChatClient:
     api_key: str = "not-needed"
     temperature: float = 0.2
     timeout_s: float = 300.0
+    # Harness virtual clock (unix seconds), set by the runner per turn and
+    # sent as X-Mind-Clock. Bare backends ignore the header; the mind honors
+    # it only when MIND_FAKE_CLOCK=1.
+    clock: float | None = None
     _client: httpx.AsyncClient | None = field(default=None, repr=False)
 
     async def __aenter__(self) -> "ChatClient":
@@ -58,11 +62,14 @@ class ChatClient:
         }
         if tools:
             body["tools"] = tools
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        if self.clock is not None:
+            headers["X-Mind-Clock"] = f"{self.clock:.3f}"
         started = time.monotonic()
         response = await self._client.post(
             f"{self.base_url.rstrip('/')}/chat/completions",
             json=body,
-            headers={"Authorization": f"Bearer {self.api_key}"},
+            headers=headers,
         )
         response.raise_for_status()
         latency = time.monotonic() - started

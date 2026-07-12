@@ -93,6 +93,11 @@ class Turn:
     # turn's reply in the transcript afterwards — the client stop button.
     # The full reply is still recorded and graded; only history is cut.
     truncate_reply_chars: int | None = None
+    # Advance the harness virtual clock by this many seconds BEFORE sending
+    # this turn (time the user spent away). The clock is sent as an
+    # X-Mind-Clock header: bare backends ignore it; the mind honors it only
+    # when MIND_FAKE_CLOCK=1 (v4 chronos scenarios).
+    advance_clock_s: float = 0.0
     # Optional canned assistant reply used by `--mock` plumbing self-tests.
     mock_reply: str | None = None
     note: str = ""
@@ -106,6 +111,9 @@ class Scenario:
     turns: list[Turn]
     system_prompt: str | None = None
     tools: list[ToolDef] = field(default_factory=list)
+    # Fixed virtual-clock start (unix seconds). Lets rubrics pin absolute
+    # times ("it's Saturday, ~14:30"). None = start at real wall time.
+    start_clock: float | None = None
 
     def tool(self, name: str) -> ToolDef:
         for tool in self.tools:

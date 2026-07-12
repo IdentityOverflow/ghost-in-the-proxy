@@ -7,6 +7,7 @@ should hold it near-flat at equal or better probe accuracy. Those two curves
 are the entire point of this module.
 """
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -122,7 +123,12 @@ async def run_scenario(
     aborted_at: int | None = None
     abort_reason = ""
     previous_load = 0
+    # Virtual clock: real turns take ~0s of story time; scenarios advance it
+    # explicitly (time the user spent away). Sent via the client as a header.
+    clock = scenario.start_clock if scenario.start_clock is not None else time.time()
     for index, turn in enumerate(scenario.turns, start=1):
+        clock += turn.advance_clock_s
+        client.clock = clock
         if isinstance(client, MockClient):
             client.next_reply = turn.mock_reply
         if turn.rewind_user_turns:
