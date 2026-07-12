@@ -64,6 +64,7 @@ async def update_summary(
         ],
         "temperature": 0.1,
         "stream": False,
+        "max_tokens": config.extraction_max_tokens,
     }
     response = await provider.chat_completions(payload)
     content = (response["choices"][0]["message"].get("content") or "").strip()
