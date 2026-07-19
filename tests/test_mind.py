@@ -475,9 +475,9 @@ def test_router_prunes_chat_turns_and_keeps_tool_turns(store):
     # Imperative probe verb: full belt forwarded.
     assert scope_tools(TOOLBELT, events, "Check the containers please") == TOOLBELT
     assert scope_tools(TOOLBELT, events, "Find out what's eating the space") == TOOLBELT
-    # Explicit tool-name mention selects just that tool.
-    named = scope_tools(TOOLBELT, events, "use tool 3 on it")
-    assert [t["function"]["name"] for t in named] == ["tool_3"]
+    # Tool talk ("use", "tool") forwards the whole belt: a false negative
+    # makes the model play-act calls, a false positive only costs schema tax.
+    assert scope_tools(TOOLBELT, events, "use tool 3 on it") == TOOLBELT
     # Small packs are never pruned.
     assert scope_tools(TOOLBELT[:2], events, "chit chat") == TOOLBELT[:2]
 
@@ -740,3 +740,39 @@ def test_fresh_session_gets_bare_time_line_not_memory_theater():
     text = render_memory("", {}, [], now=now)
     assert text == "Current time: Saturday 2026-03-14 14:26."
     assert MIND_HEADER not in text
+
+
+def test_router_forwards_belt_on_tool_talk_live_repro():
+    """Live failure (PI + xwiki MCP adapter, 2026-07-12): 'use the ... tools
+    to tell me ...' matched no probe verb, the belt was stripped, and gemma
+    play-acted the call as text then confabulated the page content."""
+    from server.mind.router import scope_tools
+
+    belt = [
+        {"type": "function", "function": {"name": name, "description": "xwiki", "parameters": {}}}
+        for name in (
+            "xwiki_get_document",
+            "xwiki_search",
+            "xwiki_create_document",
+            "xwiki_list_spaces",
+            "xwiki_update_document",
+        )
+    ]
+    text = (
+        "please use the xwiki mpc tools available to tell me the content "
+        "from the page with ref Sandbox.TestPage3"
+    )
+    assert scope_tools(belt, [], text) == belt
+    # Even without the words 'use'/'tools', naming the domain is enough.
+    assert scope_tools(belt, [], "what's on the xwiki sandbox page?") == belt
+
+
+def test_router_still_prunes_pure_chat_with_fat_belt():
+    from server.mind.router import scope_tools
+
+    belt = [
+        {"type": "function", "function": {"name": name, "description": "d", "parameters": {}}}
+        for name in ("disk_usage", "docker_ps", "query_metrics", "dns_lookup")
+    ]
+    assert scope_tools(belt, [], "talk me through a sane monthly checklist for my homelab") == []
+    assert scope_tools(belt, [], "should I move my reverse proxy from nginx to caddy?") == []
