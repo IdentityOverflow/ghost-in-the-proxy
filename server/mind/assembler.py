@@ -14,7 +14,7 @@ from typing import Any
 
 from .config import MindConfig
 from .dynamics import ThreadState
-from .store import Event
+from .store import Event, content_text
 
 
 @dataclass
@@ -330,15 +330,20 @@ def _mark_gaps(
         ):
             message = render[event.seq]
             content = message.get("content")
+            # The marker pins the absolute arrival time, so the model never
+            # has to add the gap to anything itself (gemma-12B added it to
+            # the header's current time when it had to).
+            marker = (
+                f"[{format_gap(event.ts - previous_ts)} pass — "
+                f"it is now {format_clock(event.ts)}]"
+            )
             if isinstance(content, str):
-                # The marker pins the absolute arrival time, so the model
-                # never has to add the gap to anything itself (gemma-12B
-                # added it to the header's current time when it had to).
-                marker = (
-                    f"[{format_gap(event.ts - previous_ts)} pass — "
-                    f"it is now {format_clock(event.ts)}]"
-                )
                 render[event.seq] = {**message, "content": f"{marker}\n\n{content}"}
+            elif isinstance(content, list):
+                render[event.seq] = {
+                    **message,
+                    "content": [{"type": "text", "text": marker}] + content,
+                }
         previous_ts = event.ts
     return render
 
@@ -357,11 +362,11 @@ def _digest_stale_tool_events(config: MindConfig, events: list[Event]) -> dict[i
         return render
     last_user_seq = max((event.seq for event in events if event.role == "user"), default=0)
     for event in events:
-        content = event.message.get("content")
+        content = content_text(event.message)
         if (
             event.role == "tool"
             and event.seq < last_user_seq
-            and isinstance(content, str)
+            and content is not None
             and len(content) > cap + 200  # only digest when it actually saves
         ):
             digest = (

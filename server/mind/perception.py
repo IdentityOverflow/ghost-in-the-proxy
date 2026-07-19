@@ -16,7 +16,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from .store import Event, MindStore, normalize_message
+from .store import Event, MindStore, content_text, normalize_message
 
 
 @dataclass
@@ -27,8 +27,7 @@ class Reconciliation:
 
 
 def _content_text(message: dict[str, Any]) -> str | None:
-    content = message.get("content")
-    return content if isinstance(content, str) else None
+    return content_text(message)
 
 
 def _matches(event: Event, message: dict[str, Any]) -> str | None:

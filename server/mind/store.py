@@ -88,6 +88,27 @@ CREATE TABLE IF NOT EXISTS thread_dynamics (
 """
 
 
+def content_text(message: dict[str, Any]) -> str | None:
+    """The message's text, whatever the wire shape: a plain string, or the
+    joined text parts of an OpenAI content-parts array (PI et al. send
+    [{"type": "text", "text": ...}]). None when there is no text at all.
+    Every mind organ that READS text goes through here; assuming str cost a
+    live session its whole router/steward/cue pipeline (belt stripped on an
+    empty user text, model play-acted the tool call)."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = [
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        joined = "\n".join(text for text in texts if text)
+        return joined if joined else None
+    return None
+
+
 def normalize_message(message: dict[str, Any]) -> str:
     """Canonical JSON for comparison and storage (role + semantic fields)."""
     keep = {

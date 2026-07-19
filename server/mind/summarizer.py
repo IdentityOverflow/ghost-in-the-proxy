@@ -10,7 +10,7 @@ from typing import Any
 
 from .assembler import estimate_tokens
 from .config import MindConfig
-from .store import Event, MindStore
+from .store import Event, MindStore, content_text
 
 SUMMARY_SYSTEM = (
     "You maintain the running memory of a conversation. Merge the existing "
@@ -74,8 +74,8 @@ async def update_summary(
 
 def _flatten(message: dict[str, Any]) -> str:
     parts = []
-    content = message.get("content")
-    if isinstance(content, str) and content:
+    content = content_text(message)
+    if content:
         parts.append(content)
     for call in message.get("tool_calls") or []:
         function = call.get("function", {})

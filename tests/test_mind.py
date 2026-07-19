@@ -776,3 +776,54 @@ def test_router_still_prunes_pure_chat_with_fat_belt():
     ]
     assert scope_tools(belt, [], "talk me through a sane monthly checklist for my homelab") == []
     assert scope_tools(belt, [], "should I move my reverse proxy from nginx to caddy?") == []
+
+
+def test_content_parts_arrays_are_first_class():
+    """Live failure #2 (PI client, 2026-07-19): PI sends OpenAI content-parts
+    arrays, every organ read content as str-or-nothing, so the router saw an
+    EMPTY user text and stripped the belt regardless of its trigger rules."""
+    from server.mind.router import scope_tools
+    from server.mind.store import content_text
+
+    parts_message = {
+        "role": "user",
+        "content": [{"type": "text", "text": "use the xwiki mpc tools available "
+                     "to tell me the content from the page with ref Sandbox.TestPage3"}],
+    }
+    assert content_text(parts_message).startswith("use the xwiki")
+    assert content_text({"role": "user", "content": "plain"}) == "plain"
+    assert content_text({"role": "assistant", "content": None}) is None
+    assert content_text({"role": "user", "content": [{"type": "image_url", "image_url": {}}]}) is None
+
+
+def test_runtime_router_sees_parts_array_text(store, tmp_path):
+    import asyncio
+
+    from server.mind.config import MindConfig
+    from server.mind.runtime import MindRuntime
+
+    runtime = MindRuntime(MindConfig(enabled=True, db_dir=str(tmp_path), window=8192))
+    belt = [
+        {"type": "function", "function": {"name": f"xwiki_op_{i}", "description": "d", "parameters": {}}}
+        for i in range(5)
+    ]
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "use the xwiki tools to "
+          "tell me the content of the page Sandbox.TestPage3"}]},
+    ]
+
+    class NoProvider:
+        async def chat_completions(self, payload):  # steward never fires here
+            raise AssertionError("no fold expected")
+
+    prepared = asyncio.run(
+        runtime.prepare(messages, NoProvider(), "m", tools=belt)
+    )
+    # Full belt forwarded: either untouched (tools_scoped False) or scoped
+    # with every xwiki tool still present. Before the fix, the router saw an
+    # empty user text and scoped the belt down to [].
+    if prepared.tools_scoped:
+        forwarded = [t["function"]["name"] for t in prepared.tools or []]
+        assert [n for n in forwarded if n.startswith("xwiki_op_")] == [
+            f"xwiki_op_{i}" for i in range(5)
+        ]

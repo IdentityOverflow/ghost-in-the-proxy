@@ -17,7 +17,7 @@ from typing import Any
 
 from .assembler import estimate_tokens
 from .config import MindConfig
-from .store import Event, MindStore
+from .store import Event, MindStore, content_text
 
 STEWARD_SYSTEM = """You maintain the structured memory of a conversation. Given the current \
 memory and new conversation turns, output the COMPLETE UPDATED memory as JSON, nothing else:
@@ -192,8 +192,8 @@ def _stamp(event: Event, now: float | None) -> str:
 
 def _flatten(message: dict[str, Any]) -> str:
     parts = []
-    content = message.get("content")
-    if isinstance(content, str) and content:
+    content = content_text(message)
+    if content:
         parts.append(content)
     for call in message.get("tool_calls") or []:
         function = call.get("function", {})

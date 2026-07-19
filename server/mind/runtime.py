@@ -29,7 +29,7 @@ from .perception import reconcile
 from .recall import RECALL_TOOL, resolve_recall
 from .router import scope_tools
 from .steward import run_steward
-from .store import MindStore
+from .store import MindStore, content_text
 from .summarizer import update_summary
 
 
@@ -104,9 +104,9 @@ class MindRuntime:
         # recall once anything has folded out of verbatim view.
         last_user_text = next(
             (
-                event.message.get("content")
+                text
                 for event in reversed(events)
-                if event.role == "user" and isinstance(event.message.get("content"), str)
+                if event.role == "user" and (text := content_text(event.message))
             ),
             "",
         )
@@ -223,8 +223,8 @@ class MindRuntime:
         for event in events:
             if event.role != "user":
                 continue
-            text = event.message.get("content")
-            if not isinstance(text, str):
+            text = content_text(event.message)
+            if not text:
                 continue
             if event.seq > applied_upto:
                 update_dynamics(states, text)

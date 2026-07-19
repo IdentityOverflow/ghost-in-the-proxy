@@ -15,7 +15,7 @@ import json
 from typing import Any
 
 from .dynamics import coverage, tokenize
-from .store import Event
+from .store import Event, content_text
 
 RECALL_TOOL = {
     "type": "function",
@@ -83,5 +83,4 @@ def resolve_recall(events: list[Event], arguments_json: str) -> str:
 
 
 def _event_text(event: Event) -> str:
-    content = event.message.get("content")
-    return content if isinstance(content, str) else ""
+    return content_text(event.message) or ""
