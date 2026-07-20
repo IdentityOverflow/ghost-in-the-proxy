@@ -66,6 +66,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="free-text run condition recorded in results (e.g. 'LM Studio, ctx 32k pinned, stop-at-limit')",
     )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="exercise the streaming path: SSE requests, usage from stream_options.include_usage",
+    )
     parser.add_argument("--mock", action="store_true", help="run against canned replies (plumbing test)")
     parser.add_argument("--list", action="store_true", help="list scenarios and exit")
     return parser.parse_args()
@@ -93,7 +98,12 @@ async def main() -> None:
     client = (
         MockClient()
         if args.mock
-        else ChatClient(base_url=args.base_url, model=args.model, temperature=args.temperature)
+        else ChatClient(
+            base_url=args.base_url,
+            model=args.model,
+            temperature=args.temperature,
+            stream=args.stream,
+        )
     )
 
     results = []
@@ -125,6 +135,7 @@ async def main() -> None:
         "wall": args.wall,
         "wall_mode": args.wall_mode,
         "judge_votes": args.judge_votes,
+        "stream": args.stream,
         "note": args.note,
         "date": datetime.now().isoformat(timespec="seconds"),
     }

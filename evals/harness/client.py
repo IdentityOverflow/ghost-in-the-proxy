@@ -1,9 +1,15 @@
 """Minimal OpenAI-compatible chat client for the eval harness.
 
-Non-streaming on purpose: `usage` reporting is reliable and the harness is
+Non-streaming by default: `usage` reporting is reliable and the harness is
 sequential. When a backend omits `usage`, prompt tokens are estimated at
 chars/4 and flagged so reports never silently mix measured and estimated
 numbers.
+
+`stream=True` exercises the proxy's streaming path (SSE) instead — the reply
+is reconstructed from deltas and usage is read from the final chunk when the
+backend honors `stream_options.include_usage`. The accumulator here is
+deliberately independent of the server's collector: the harness is the
+outside instrument that verifies the proxy, so it must not share its parser.
 """
 
 import json
@@ -38,6 +44,7 @@ class ChatClient:
     # sent as X-Mind-Clock. Bare backends ignore the header; the mind honors
     # it only when MIND_FAKE_CLOCK=1.
     clock: float | None = None
+    stream: bool = False
     _client: httpx.AsyncClient | None = field(default=None, repr=False)
 
     async def __aenter__(self) -> "ChatClient":
@@ -58,24 +65,29 @@ class ChatClient:
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
-            "stream": False,
+            "stream": self.stream,
         }
+        if self.stream:
+            body["stream_options"] = {"include_usage": True}
         if tools:
             body["tools"] = tools
         headers = {"Authorization": f"Bearer {self.api_key}"}
         if self.clock is not None:
             headers["X-Mind-Clock"] = f"{self.clock:.3f}"
         started = time.monotonic()
-        response = await self._client.post(
-            f"{self.base_url.rstrip('/')}/chat/completions",
-            json=body,
-            headers=headers,
-        )
-        response.raise_for_status()
+        if self.stream:
+            message, usage = await self._complete_stream(body, headers)
+        else:
+            response = await self._client.post(
+                f"{self.base_url.rstrip('/')}/chat/completions",
+                json=body,
+                headers=headers,
+            )
+            response.raise_for_status()
+            data = response.json()
+            message = data["choices"][0]["message"]
+            usage = data.get("usage") or {}
         latency = time.monotonic() - started
-        data = response.json()
-        message = data["choices"][0]["message"]
-        usage = data.get("usage") or {}
         prompt_tokens = usage.get("prompt_tokens")
         completion_tokens = usage.get("completion_tokens")
         estimated = prompt_tokens is None
@@ -90,6 +102,55 @@ class ChatClient:
             usage_estimated=estimated,
             latency_s=latency,
         )
+
+    async def _complete_stream(
+        self, body: dict[str, Any], headers: dict[str, str]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Reconstruct (message, usage) from an SSE stream."""
+        content: list[str] = []
+        tool_calls: dict[int, dict[str, Any]] = {}
+        usage: dict[str, Any] = {}
+        assert self._client is not None
+        async with self._client.stream(
+            "POST",
+            f"{self.base_url.rstrip('/')}/chat/completions",
+            json=body,
+            headers=headers,
+        ) as response:
+            if response.status_code >= 400:
+                await response.aread()
+                response.raise_for_status()
+            async for line in response.aiter_lines():
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    continue
+                try:
+                    chunk = json.loads(data)
+                except ValueError:
+                    continue
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+                choices = chunk.get("choices") or []
+                delta = choices[0].get("delta", {}) if choices else {}
+                if delta.get("content"):
+                    content.append(delta["content"])
+                for fragment in delta.get("tool_calls") or []:
+                    call = tool_calls.setdefault(
+                        fragment.get("index", 0),
+                        {"id": None, "type": "function", "function": {"name": "", "arguments": ""}},
+                    )
+                    if fragment.get("id"):
+                        call["id"] = fragment["id"]
+                    function = fragment.get("function") or {}
+                    call["function"]["name"] += function.get("name") or ""
+                    call["function"]["arguments"] += function.get("arguments") or ""
+        message: dict[str, Any] = {"role": "assistant", "content": "".join(content) or None}
+        if tool_calls:
+            message["tool_calls"] = [call for _, call in sorted(tool_calls.items())]
+        return message, usage
 
 
 @dataclass
