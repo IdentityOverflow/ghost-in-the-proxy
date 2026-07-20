@@ -51,6 +51,45 @@ def test_new_session_then_continue(store):
     assert [e.confirmed for e in events] == [True, True, True]
 
 
+def test_different_system_prompt_rejects_short_coincidence(store):
+    # Two clients both open with "hi": a one-message overlap under a
+    # different system prompt is coincidence, not the same conversation.
+    system_a = {"role": "system", "content": "You are client A."}
+    system_b = {"role": "system", "content": "You are client B."}
+    recon_a, _ = play_turn(store, [system_a, user("hi")], "hello!")
+    recon_b = reconcile(store, [system_b, user("hi")])
+    assert recon_b.outcome == "new"
+    assert recon_b.session_id != recon_a.session_id
+
+
+def test_system_prompt_breaks_tie_between_identical_openings(store):
+    # Both sessions hold the identical two-message opening; only the client
+    # system prompt distinguishes them. The matching prompt must win.
+    system_a = {"role": "system", "content": "You are client A."}
+    system_b = {"role": "system", "content": "You are client B."}
+    opening = [user("hi"), assistant("Acknowledged.")]
+    recon_a = reconcile(store, [system_a] + opening)
+    recon_b = reconcile(store, [system_b] + opening)
+    assert recon_a.session_id != recon_b.session_id
+
+    recon = reconcile(store, [system_b] + opening + [user("what did I configure?")])
+    assert recon.outcome == "continue"
+    assert recon.session_id == recon_b.session_id
+
+
+def test_same_client_system_change_still_continues(store):
+    # Dynamic system prompts: the same client varying its prompt must not
+    # lose its session — two matched user turns outrank the prompt change.
+    system_v1 = {"role": "system", "content": "Prompt version 1."}
+    system_v2 = {"role": "system", "content": "Prompt version 2."}
+    history = [user("plan the trip to Kyoto"), assistant("planned"), user("add a temple day")]
+    recon1 = reconcile(store, [system_v1] + history)
+    transcript = [system_v2] + history + [assistant("added"), user("book it")]
+    recon2 = reconcile(store, transcript)
+    assert recon2.outcome == "continue"
+    assert recon2.session_id == recon1.session_id
+
+
 def test_truncation_stop_button(store):
     recon1, reply_seq = play_turn(store, [user("explain quantum physics")], "It is a long story about particles and waves")
 

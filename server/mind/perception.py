@@ -75,6 +75,7 @@ def reconcile(
     client_system, incoming = _split_system(messages)
 
     best: tuple[int, str, str, list[Event]] | None = None  # matched, kind, session, events
+    best_key = (0, False)
     for session_id in store.list_session_ids():
         events = store.live_events(session_id)
         if not events:
@@ -82,8 +83,26 @@ def reconcile(
         matched, kind = _score_match(events, incoming)
         if matched == 0:
             continue
-        if best is None or matched > best[0]:
+        # System-prompt tiebreaker: a shared opening between two different
+        # clients is coincidence, not identity — and assistant messages
+        # (greetings, acknowledgements) coincide easily, so the evidence
+        # unit is matched USER turns. A differing client system prompt
+        # demands >=2 of them; a solid match still wins even when the
+        # prompt changed, because the same client may legitimately vary
+        # its prompt between requests (dynamic prompts). On equal-length
+        # matches the matching prompt wins. Rationale for the reject side:
+        # misjoining two clients corrupts both minds; re-newing a
+        # one-exchange-old session loses almost nothing.
+        system_match = (store.get_client_system(session_id) or "") == (client_system or "")
+        matched_user_turns = sum(
+            1 for event in events[:matched] if event.role == "user"
+        )
+        if not system_match and matched_user_turns < 2:
+            continue
+        key = (matched, system_match)
+        if key > best_key:
             best = (matched, kind, session_id, events)
+            best_key = key
 
     # A session continues only if every incoming message up to the stored
     # history matched (no divergence inside the shared span). Divergence with
