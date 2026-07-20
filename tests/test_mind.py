@@ -102,6 +102,26 @@ def test_s12_zero_overlap_is_certified_by_the_real_tokenizer():
     assert len(tokenize(ASIDE) & tokenize(PROBE_LEXICAL)) >= 2
 
 
+def test_s13_probe_overlaps_certified_by_the_real_tokenizer():
+    # Probe A must share nothing with the courier turn, probe B nothing with
+    # the cat turn (its answer), and the control must keep >=2 hits on the
+    # radiator turn (cue reinjection needs 2). Full turn texts, not asides:
+    # lexical search sees whole events.
+    from evals.scenarios.s13_sequence_recall import (
+        PROBE_CONTROL,
+        PROBE_DROPPED,
+        PROBE_ORDER,
+        TURN_CAT,
+        TURN_COURIER,
+        TURN_RADIATOR,
+    )
+    from server.mind.dynamics import tokenize
+
+    assert tokenize(TURN_COURIER) & tokenize(PROBE_DROPPED) == set()
+    assert tokenize(TURN_CAT) & tokenize(PROBE_ORDER) == set()
+    assert len(tokenize(TURN_RADIATOR) & tokenize(PROBE_CONTROL)) >= 2
+
+
 def test_truncation_stop_button(store):
     recon1, reply_seq = play_turn(store, [user("explain quantum physics")], "It is a long story about particles and waves")
 
