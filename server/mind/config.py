@@ -6,6 +6,9 @@ from pydantic import BaseModel
 class MindConfig(BaseModel):
     enabled: bool = os.getenv("MIND_ENABLED", "0") == "1"
     db_dir: str = os.getenv("MIND_DB_DIR", "var/minds")
+    # Raw-memory backend behind the cue→episode interface (server/mind/mem.py):
+    # "lexical" (default, v3 behavior). Unknown names fail open to lexical.
+    mem_backend: str = os.getenv("MIND_MEM_BACKEND", "lexical")
     # Target model window. 8k is the design floor (docs/architecture.md);
     # set to the backend's actual loaded context for tighter conditions.
     window: int = int(os.getenv("MIND_WINDOW", "8192"))

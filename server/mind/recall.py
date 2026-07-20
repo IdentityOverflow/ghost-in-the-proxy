@@ -14,8 +14,8 @@ reconciliation. It is deliberation, not conversation truth.
 import json
 from typing import Any
 
-from .dynamics import coverage, tokenize
-from .store import Event, content_text
+from .mem import LexicalMem, MemBackend, MemQuery
+from .store import Event
 
 RECALL_TOOL = {
     "type": "function",
@@ -49,38 +49,37 @@ def is_recall_call(call: dict[str, Any]) -> bool:
     return call.get("function", {}).get("name") == "recall"
 
 
-def resolve_recall(events: list[Event], arguments_json: str) -> str:
-    """Lexical search over live events; verbatim spans, best first."""
+def resolve_recall(
+    events: list[Event],
+    arguments_json: str,
+    backend: MemBackend | None = None,
+    session_id: str = "",
+    trajectory: list[Event] | None = None,
+) -> str:
+    """Search raw memory via the Mem backend; verbatim spans, best first.
+
+    Default backend is lexical — v3 behavior unchanged. The runtime passes
+    its configured backend plus the recent-events trajectory stub.
+    """
     try:
         query = str(json.loads(arguments_json or "{}").get("query") or "")
     except json.JSONDecodeError:
         query = arguments_json or ""
-    query_tokens = tokenize(query)
-    if not query_tokens:
+    if not query.strip():
         return "recall error: empty query"
 
-    scored: list[tuple[float, Event, str]] = []
-    for event in events:
-        text = _event_text(event)
-        if not text:
-            continue
-        cov, hits = coverage(query_tokens, tokenize(text))
-        if hits == 0:
-            continue
-        # Coverage ranks; an exact-phrase hit dominates (verbatim requests
-        # usually carry a distinctive fragment of the sought material).
-        score = cov + (1.0 if query.strip() and query.strip().lower() in text.lower() else 0.0)
-        scored.append((score, event, text))
-    if not scored:
+    mem = backend if backend is not None else LexicalMem()
+    spans = mem.query(
+        session_id,
+        MemQuery(text=query, trajectory=trajectory or [], k=MAX_RESULTS),
+        events,
+    )
+    if not spans:
         return f"recall: nothing found for {query!r}"
 
-    scored.sort(key=lambda item: item[0], reverse=True)
     lines = []
-    for score, event, text in scored[:MAX_RESULTS]:
+    for span in spans:
+        text = span.text
         snippet = text if len(text) <= SPAN_CHAR_CAP else text[:SPAN_CHAR_CAP] + " …[truncated]"
-        lines.append(f"[seq {event.seq}, {event.role}, verbatim]\n{snippet}")
+        lines.append(f"[seq {span.seq}, {span.role}, verbatim]\n{snippet}")
     return "\n\n".join(lines)
-
-
-def _event_text(event: Event) -> str:
-    return content_text(event.message) or ""

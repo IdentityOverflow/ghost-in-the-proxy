@@ -122,6 +122,108 @@ def test_s13_probe_overlaps_certified_by_the_real_tokenizer():
     assert len(tokenize(TURN_RADIATOR) & tokenize(PROBE_CONTROL)) >= 2
 
 
+class _RecordingMem:
+    """Fake backend: records hook calls, answers every content query."""
+
+    name = "recording"
+
+    def __init__(self):
+        self.observed: list[tuple[str, int]] = []
+        self.boundaries: list[tuple[str, str, int]] = []
+        self.queries: list = []
+
+    def observe(self, session_id, event):
+        self.observed.append((session_id, event.seq))
+
+    def boundary(self, session_id, reason, upto_seq):
+        self.boundaries.append((session_id, reason, upto_seq))
+
+    def query(self, session_id, query, events):
+        from server.mind.mem import MemSpan
+
+        self.queries.append(query)
+        return [MemSpan(seq=1, role="user", text="canned span", score=1.0, backend=self.name)]
+
+
+def test_mem_backend_swap_and_trajectory(store, tmp_path):
+    import asyncio
+
+    from server.mind.runtime import MindRuntime
+
+    runtime = MindRuntime(config(db_dir=str(tmp_path / "minds")))
+    runtime.mem = _RecordingMem()
+
+    async def go():
+        transcript = [user("first question")]
+        prepared = await runtime.prepare(transcript, provider=None, model="m")
+        # observe fired once per confirmed event, no duplicates on re-prepare
+        assert runtime.mem.observed == [(prepared.session_id, 1)]
+        transcript += [assistant("an answer"), user("second question")]
+        await runtime.prepare(transcript, provider=None, model="m")
+        assert [seq for _, seq in runtime.mem.observed] == [1, 2, 3]
+
+        out = runtime.resolve_recall(prepared.session_id, '{"query": "anything at all"}')
+        assert "canned span" in out and "[seq 1, user, verbatim]" in out
+        assert runtime.mem.queries[-1].trajectory  # trajectory stub supplied
+        assert runtime.mem.queries[-1].kind == "content"
+
+    asyncio.run(go())
+
+
+def test_mem_boundary_fires_on_fold(store, tmp_path, monkeypatch):
+    import asyncio
+
+    from server.mind import runtime as runtime_module
+    from server.mind.runtime import MindRuntime
+
+    # Tiny window: the texture must genuinely overflow — folds are a
+    # pressure response, never a default.
+    cfg = config(
+        db_dir=str(tmp_path / "minds"),
+        window=256,
+        summary_trigger_tokens=10,
+        min_keep_turns=1,
+    )
+    runtime = MindRuntime(cfg)
+    runtime.mem = _RecordingMem()
+
+    async def fake_steward(config, store_, session_id, events, provider, model, upto, now=None):
+        store_.append_summary(session_id, upto, "condensed")
+
+    monkeypatch.setattr(runtime_module, "run_steward", fake_steward)
+
+    async def go():
+        transcript = [user("a rather long opening message about many topics " * 30)]
+        prepared = await runtime.prepare(transcript, provider=None, model="m")
+        transcript += [assistant("reply " * 120), user("next")]
+        await runtime.prepare(transcript, provider=None, model="m")
+        assert runtime.mem.boundaries, "fold should signal a Mem boundary"
+        session_id, reason, upto = runtime.mem.boundaries[0]
+        assert session_id == prepared.session_id and reason == "fold" and upto >= 1
+
+    asyncio.run(go())
+
+
+def test_lexical_mem_matches_v3_ranking(store):
+    from server.mind.mem import LexicalMem, MemQuery
+
+    sid = store.create_session(None)
+    store.append_event(sid, user("the tortoise Muriel lived in the stairwell"), source="client")
+    store.append_event(sid, user("completely unrelated gardening chatter"), source="client")
+    events = store.live_events(sid)
+    spans = LexicalMem().query(sid, MemQuery(text="Muriel stairwell tortoise"), events)
+    assert spans and spans[0].seq == 1 and spans[0].backend == "lexical"
+    # order queries: honest empty, never a guess
+    assert LexicalMem().query(sid, MemQuery(text="x", kind="next", anchor_seq=1), events) == []
+
+
+def test_create_mem_backend_fails_open_to_lexical():
+    from server.mind.mem import LexicalMem, create_mem_backend
+
+    assert isinstance(create_mem_backend("lexical"), LexicalMem)
+    assert isinstance(create_mem_backend("no-such-backend"), LexicalMem)
+
+
 def test_truncation_stop_button(store):
     recon1, reply_seq = play_turn(store, [user("explain quantum physics")], "It is a long story about particles and waves")
 

@@ -26,6 +26,7 @@ from .assembler import ThreadsView, Workspace, assemble, estimate_tokens
 from .config import MindConfig, mind_config
 from .dynamics import ThreadState, admitted_threads, cued_threads, update_dynamics
 from .perception import reconcile
+from .mem import create_mem_backend
 from .recall import RECALL_TOOL, resolve_recall
 from .router import scope_tools
 from .steward import run_steward
@@ -52,6 +53,13 @@ class MindRuntime:
         self.config = config
         db_path = Path(config.db_dir) / "minds.sqlite3"
         self.store = MindStore(db_path)
+        self.mem = create_mem_backend(config.mem_backend)
+        # Per-session observe watermark: events enter Mem at the same moment
+        # reconciliation confirms them as conversation truth. After a fork,
+        # the rewritten tail gets fresh seqs above the watermark, so it is
+        # re-observed; stale spans in stateful backends are superseded
+        # territory (a future boundary reason), not v0's problem.
+        self._mem_seen: dict[str, int] = {}
 
     async def prepare(
         self,
@@ -69,6 +77,12 @@ class MindRuntime:
         # steward timestamps) inert.
         clock = (now if now is not None else time.time()) if self.config.time_enabled else None
         events = self.store.live_events(recon.session_id)
+        seen = self._mem_seen.get(recon.session_id, 0)
+        for event in events:
+            if event.seq > seen:
+                self.mem.observe(recon.session_id, event)
+        if events:
+            self._mem_seen[recon.session_id] = events[-1].seq
         client_system = self.store.get_client_system(recon.session_id)
         summary = self.store.latest_summary(recon.session_id)
         records = self.store.live_records(recon.session_id)
@@ -102,6 +116,10 @@ class MindRuntime:
             workspace = assemble(
                 self.config, client_system, events, summary, records, episodes, threads, now=clock
             )
+            # A fold is an episode boundary: everything up to the watermark
+            # left verbatim view. (Thread-dormancy transitions are a future,
+            # finer-grained boundary signal.)
+            self.mem.boundary(recon.session_id, "fold", upto)
 
         # v3 routing: scope the client's tool pack to this turn, and offer
         # recall once anything has folded out of verbatim view.
@@ -166,7 +184,16 @@ class MindRuntime:
         )
 
     def resolve_recall(self, session_id: str, arguments_json: str) -> str:
-        return resolve_recall(self.store.live_events(session_id), arguments_json)
+        events = self.store.live_events(session_id)
+        # The trajectory stub: recent verbatim context as the episodic cue
+        # (single moments are ambiguous — holographic experiment #5).
+        return resolve_recall(
+            events,
+            arguments_json,
+            backend=self.mem,
+            session_id=session_id,
+            trajectory=events[-8:],
+        )
 
     def observe_reply(
         self,
