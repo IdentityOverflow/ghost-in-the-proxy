@@ -23,9 +23,16 @@ This document synthesizes three prior designs into one buildable system:
 
 Formally, the middleware is an RO Observer tuple **O = (B, M, R, Mem)**:
 B = semantic world model, M = workspace, R = router/executive policy,
-Mem = episodic index. Mem is an interface (`cue → episode`), so the vector
-store can later be swapped for the holographic reel from ROFramework-PyLib
-without touching the rest.
+Mem = episodic index. Mem is an interface (`cue → episode`, implemented in
+`server/mind/mem.py` as the async `MemBackend` protocol) with two
+occupants: **lexical** (v3 search, the default) and **embedding** (bge-m3
+vectors, hybrid-scored with the lexical signals). Queries carry a
+trajectory stub, `"next"` is a first-class query kind answered from log
+order, and spans keep seq provenance. The holographic reel was evaluated
+for this socket and deliberately *not* adopted: superposition adds no
+retrieval capability over embeddings + a totally-ordered log (its live
+role is dynamical — value-tagged episodes biasing salience — which is a
+different organ than retrieval, if it ever lands here).
 
 ## Position in the stack
 
@@ -161,6 +168,20 @@ transcript, a workspace miss must be recoverable: the mind exposes a
 `recall` tool to the model (query → episodic shards / raw transcript spans
 with provenance). The model can ask for what the assembler didn't give it.
 This also turns retrieval misses into observable events for tuning.
+Recall works on both request paths: non-stream resolves hops inline; the
+streaming path holds chunks while a reply could still be a pure recall
+call, resolves invisibly, and re-queries — nothing leaks to the client,
+and mixed recall+client batches pass through untouched on both paths.
+
+**Auto-cue (the s13 lesson).** Models do not reliably *call* recall — in
+every s13 arm the model answered from what it could see rather than reach
+for the tool. So backends that support it (embedding) also get a per-turn
+push channel: the latest user message queries raw memory, and up to two
+FOLDED spans with a genuinely semantic match (cosine floor; lexical hits
+are excluded — they already have the cue and recall channels) render into
+a seq-tagged "Recalled verbatim" section. The seq tags are deliberate:
+s13's baseline failed with the answer merely *present* in context, and
+order questions are only answerable when the sequence numbers are visible.
 
 ## Data model (sketch)
 
@@ -175,9 +196,11 @@ commitments   (id, actor, statement, trigger, status, due, provenance_seq)
 artifacts     (id, kind, content, ttl, promoted)          -- worker outputs, tool digests
 ```
 
-SQLite per mind (same pattern the openclaw cognitive-workspace proved),
-embeddings optional and additive (FTS first; vectors when needed; the
-holographic reel as a future Mem backend behind the same cue→episode call).
+SQLite per mind (same pattern the openclaw cognitive-workspace proved).
+Embeddings live in the same file — `embeddings (session, seq, model, vec)`,
+float32 BLOBs, numpy brute-force cosine at query time (sub-millisecond at
+conversation scale; a vector-db dependency would be decoration). The
+`model` column keeps vectors from different embedders from ever mixing.
 
 **v0 schema invariant:** every derived row is append-only and stamped with
 the event seq that produced it; corrections are supersede links, never
@@ -196,6 +219,8 @@ what the client retained.
 | **v2 dynamics** | CRS thread activations, decay, question attractors, idle reflection | s5 pair holds with *smaller* mean workspace; no regressions; retrieval hit-rate up |
 | **v3 routing/workers** | router, scoped tool packs, contained workers, `recall` tool | s2 completes @8k with synthesis probe attempted; s6 curve flat after dump |
 | **v4 chronos** | wall-clock time as a first-class input (`MIND_TIME`): event timestamps read back, current time + elapsed-gap markers rendered, steward converts relative triggers to absolute `due` datetimes, OVERDUE surfaces on return | s11 duration + time-of-day probes pass; v3 and baseline fail them identically (no clock anywhere); no 8k regression |
+| **v4.1 streaming + tidy** | recall hops on the streaming path (hold-and-decide interception), streamed tool-call recording, harness `--stream`, session-resolver system-prompt tiebreaker (matched *user* turns as the evidence unit), s2 canned world consistent under exploration | s9 `--stream` 2/2 with the hop in telemetry; s2 3/3 across exploratory draws; 4k/8k suite unchanged |
+| **v5 Mem socket** | `MemBackend` protocol (async; trajectory cues, `"next"` kind, seq-provenance spans) + `EmbeddingMem` (bge-m3, hybrid lexical+cosine, fail-open) + per-turn auto-cue of folded semantic spans | **s13 confirm-failed on lexical** (dropped detail 0/3, order fold-dependent; baseline confabulates order with the answer in view), **then flipped: 3/3 × three draws on embedding**; s12 (distillation coverage) and s9 (verbatim reach) unchanged |
 
 The s2 synthesis probe doubles as a leak detector throughout: if it starts
 passing before v3's worker route exists, the harness is leaking hints.

@@ -40,11 +40,22 @@ guaranteed and the probes stay fair; the skipped call is recorded.
 | `s4-contradiction` | corrected fact (8080→9090) must supersede but stay in history | recent-wording-wins; or overwrite erases the transition |
 | `s5-salience` | vivid irrelevant aside: stays out of scene, recallable on cue | decay implemented as deletion, or no decay at all |
 | `s6-containment` | one heavy document-dump task mid-session | every later turn pays the dump's cost forever |
+| `s7-fork` | client edits + regenerates rewrite history mid-run | memory follows the dead branch, or spawns a fresh session |
+| `s8-interrupt` | stop-button truncations mid-reply | undelivered text remembered as if the client saw it |
+| `s9-verbatim` | exact traceback line 12 turns past the fold | distilled memory paraphrases where only verbatim will do |
+| `s10-tool-tax` | eight fat tool schemas offered every turn, two turns need one | schema bulk taxes every request forever |
+| `s11-time` | reminder with a 2h window; user leaves and returns silently | no clock: duration and time-of-day confabulated |
+| `s12-semantic-callback` | zero-word-overlap paraphrase of a folded aside (+ lexical control) | recall reachable only through exact words — **verdict: distillation already covers memorable asides; kept as a regression guard on that** |
+| `s13-sequence-recall` | mundane dropped detail + which-interruption-came-after (+ lexical control) | steward-dropped one-shots unreachable; incidental order lost at the fold (stuffing *confabulates* it) — the gate that motivated the embedding Mem backend |
 
-S5 and S6 are the discriminating ones. S5's probe pair (unprompted
-resurfacing = fail, cued recall = pass) can't be satisfied by either
-keep-everything or hard-delete strategies. S6's token bars make the
-"accumulated corpse" signature directly visible.
+S5 and S6 are the discriminating ones among the originals. S5's probe pair
+(unprompted resurfacing = fail, cued recall = pass) can't be satisfied by
+either keep-everything or hard-delete strategies. S6's token bars make the
+"accumulated corpse" signature directly visible. S12/S13 are
+*discriminators*: authored to confirm-fail on the current build and decide
+whether the next organ deserves to exist — s12 answered no, s13 answered
+yes. Interpret them by mechanism (ledger, threads, episodes, cue/admission
+telemetry, recall hops), not by score alone.
 
 ## Running
 
@@ -68,6 +79,12 @@ PYTHONPATH=. python -m evals.run --base-url http://localhost:8000/v1 \
 
 # single scenario
 PYTHONPATH=. python -m evals.run --scenario s4-contradiction --label quick
+
+# whole suite over SSE (streaming path; usage measured via stream_options)
+PYTHONPATH=. python -m evals.run --stream --label mind-streamed
+
+# re-score stored replies after a rubric fix — no re-sampling
+PYTHONPATH=. python -m evals.regrade evals/results/<run-dir>
 ```
 
 Results land in `evals/results/<timestamp>-<label>/` as `results.json`
