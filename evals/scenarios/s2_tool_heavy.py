@@ -116,6 +116,72 @@ tests/test_scheduler.py:12:HEARTBEAT_MS = 250
 tests/test_scheduler.py:39:    # 250ms heartbeat -> ~5 ticks in 1.2 seconds
 '''
 
+# Exploration support: models sometimes open with ls/find or read the test
+# file before running pytest (the observed s2-t1 spiral). The fictional repo
+# must be CONSISTENT under that exploration — an empty `ls` in a repo whose
+# files demonstrably exist reads as a broken environment and dooms the run.
+# None of these leak the bug: the answer still requires synthesizing the
+# sleep line, the ms comment, and the test expectation.
+
+LS_OUTPUT = """\
+$ run_command ls -R
+.:
+README.md  app  pyproject.toml  tests
+
+./app:
+__init__.py  config.py  jobs  scheduler.py
+
+./app/jobs:
+__init__.py  registry.py
+
+./tests:
+__init__.py  test_scheduler.py
+"""
+
+TEST_SCHEDULER_PY = '''\
+$ read_file tests/test_scheduler.py
+"""Scheduler cadence tests."""
+
+import time
+
+from app.scheduler import Scheduler
+from tests.helpers import tick_counter
+
+HEARTBEAT_MS = 250
+
+
+def test_start_stop():
+    scheduler = Scheduler()
+    scheduler.start()
+    scheduler.stop()
+
+
+def test_ticks_every_quarter_second():
+    scheduler = Scheduler()
+    scheduler.start()
+    time.sleep(1.2)
+    scheduler.stop()
+    # 250ms heartbeat -> ~5 ticks in 1.2 seconds
+    assert 4 <= tick_counter.count <= 6, (
+        f"expected ~5 ticks in 1.2s at 250ms heartbeat, got {tick_counter.count}"
+    )
+'''
+
+REGISTRY_PY = '''\
+$ read_file app/jobs/registry.py
+"""Job registry: which jobs are due at a given time."""
+
+_JOBS = []
+
+
+def register(job):
+    _JOBS.append(job)
+
+
+def due_jobs(now):
+    return [job for job in _JOBS if job.next_run_at <= now]
+'''
+
 TOOLS = [
     ToolDef(
         name="read_file",
@@ -126,6 +192,10 @@ TOOLS = [
             "required": ["path"],
         },
         results=[
+            # "test" must precede "scheduler": tests/test_scheduler.py
+            # contains both substrings.
+            CannedResult(match="test", content=TEST_SCHEDULER_PY),
+            CannedResult(match="registry", content=REGISTRY_PY),
             CannedResult(match="scheduler", content=SCHEDULER_PY),
             CannedResult(match="config", content=CONFIG_PY),
             CannedResult(match=None, content="error: file not found"),
@@ -140,8 +210,15 @@ TOOLS = [
             "required": ["command"],
         },
         results=[
+            # pytest/grep first: they win even when a command string would
+            # also substring-match an exploration entry below.
             CannedResult(match="pytest", content=PYTEST_OUTPUT),
             CannedResult(match="grep", content=GREP_OUTPUT),
+            CannedResult(match="ls", content=LS_OUTPUT),
+            CannedResult(match="find", content=LS_OUTPUT),
+            CannedResult(match="tree", content=LS_OUTPUT),
+            CannedResult(match="pwd", content="$ run_command pwd\n/workspace/pulsehub"),
+            CannedResult(match="cat", content="(cat is unavailable here — use the read_file tool)"),
             CannedResult(match=None, content="(command produced no output)"),
         ],
     ),
@@ -194,8 +271,11 @@ SCENARIO = Scenario(
                     kind="must_mention",
                     desc="names the unit mismatch (ms consumed as seconds)",
                     patterns=[
-                        r"millisecond.{0,80}second",
-                        r"second.{0,80}millisecond",
+                        # Gap sized for prose like "…milliseconds) directly as
+                        # the argument for time.sleep(), but time.sleep()
+                        # expects the duration in seconds" (~112 chars).
+                        r"millisecond.{0,160}second",
+                        r"second.{0,160}millisecond",
                         r"ms.{0,60}(as|vs\.?|instead of|not).{0,20}s(econds)?\b",
                         r"250\s*(ms|millisecond).{0,80}250\s*s(econds)?",
                         r"/\s*1000|divide.{0,30}1000|1000\.0",
