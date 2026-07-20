@@ -64,7 +64,7 @@ pytest tests/   # unit tests: perception, store invariants, assembler, dynamics,
 
 ## Provenance
 
-Grown from three design documents — a conscious-workspace anatomy, a cognitive-runtime physiology (CRS), and an organic-development sketch (OCA) — synthesized into one middleware and gated phase by phase on eval numbers. The name is the project: a ghost living inside the shell of a passthrough proxy.
+Grown from three design documents — a [conscious-workspace anatomy](https://github.com/IdentityOverflow/idea_drawer/blob/main/cognitive_workspace_architecture.md), a [cognitive-runtime physiology](https://github.com/IdentityOverflow/idea_drawer/blob/main/cognitive_runtime_with_SLMs.md) (CRS), and an [organic-development sketch](https://github.com/IdentityOverflow/idea_drawer/blob/main/organic_cognitive_architecture_oca.md) (OCA) — synthesized into one middleware and gated phase by phase on eval numbers. The name is the project: a ghost living inside the shell of a passthrough proxy.
 
 ## License
 MIT

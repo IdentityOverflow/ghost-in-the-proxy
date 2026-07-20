@@ -17,9 +17,9 @@ This document synthesizes three prior designs into one buildable system:
 
 | source | contributes | timescale |
 |---|---|---|
-| `openclaw/Cognitive_architecture.txt` | anatomy — stores, components, contracts | per-turn |
-| `idea_drawer/cognitive_runtime_with_SLMs.md` (CRS) | physiology — activation dynamics, reflection/idle modes | seconds–minutes |
-| `idea_drawer/organic_cognitive_architecture_oca.md` (OCA) | development — RPE-gated learning, sleep consolidation | days–weeks (future) |
+| [Cognitive Workspace Architecture](https://github.com/IdentityOverflow/idea_drawer/blob/main/cognitive_workspace_architecture.md) | anatomy — stores, components, contracts | per-turn |
+| [Cognitive Runtime Architecture](https://github.com/IdentityOverflow/idea_drawer/blob/main/cognitive_runtime_with_SLMs.md) (CRS) | physiology — activation dynamics, reflection/idle modes | seconds–minutes |
+| [Organic Cognitive Architecture](https://github.com/IdentityOverflow/idea_drawer/blob/main/organic_cognitive_architecture_oca.md) (OCA) | development — RPE-gated learning, sleep consolidation | days–weeks (future) |
 
 Formally, the middleware is an RO Observer tuple **O = (B, M, R, Mem)**:
 B = semantic world model, M = workspace, R = router/executive policy,
