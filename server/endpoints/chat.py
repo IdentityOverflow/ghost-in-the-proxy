@@ -137,7 +137,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         hops += 1
                         followup = list(stream_payload["messages"]) + [message]
                         for call in calls:
-                            content = mind.resolve_recall(
+                            content = await mind.resolve_recall(
                                 session_id, call.get("function", {}).get("arguments") or "{}"
                             )
                             followup.append(
@@ -196,7 +196,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             hops += 1
             followup = list(payload["messages"]) + [message]
             for call in recall_calls:
-                content = mind.resolve_recall(
+                content = await mind.resolve_recall(
                     session_id, call.get("function", {}).get("arguments") or "{}"
                 )
                 followup.append(

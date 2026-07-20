@@ -85,6 +85,13 @@ CREATE TABLE IF NOT EXISTS thread_dynamics (
     updated_seq INTEGER NOT NULL,   -- last event seq applied (tick idempotence)
     PRIMARY KEY (session, key)
 );
+CREATE TABLE IF NOT EXISTS embeddings (
+    session TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    model TEXT NOT NULL,            -- embeddings from different models never mix
+    vec BLOB NOT NULL,              -- float32 array bytes; dim implied by model
+    PRIMARY KEY (session, seq, model)
+);
 """
 
 
@@ -289,6 +296,23 @@ class MindStore:
             (session_id,),
         ).fetchone()
         return (row[0], row[1]) if row else None
+
+    def put_embedding(self, session_id: str, seq: int, model: str, vec: bytes) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO embeddings (session, seq, model, vec) VALUES (?, ?, ?, ?)",
+                (session_id, seq, model, vec),
+            )
+
+    def get_embeddings(self, session_id: str, model: str) -> list[tuple[int, bytes]]:
+        with self._lock:
+            return [
+                (row[0], row[1])
+                for row in self._conn.execute(
+                    "SELECT seq, vec FROM embeddings WHERE session = ? AND model = ? ORDER BY seq",
+                    (session_id, model),
+                )
+            ]
 
     def append_summary(self, session_id: str, upto_seq: int, content: str) -> None:
         with self._lock, self._conn:

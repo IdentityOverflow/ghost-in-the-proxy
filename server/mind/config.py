@@ -7,8 +7,16 @@ class MindConfig(BaseModel):
     enabled: bool = os.getenv("MIND_ENABLED", "0") == "1"
     db_dir: str = os.getenv("MIND_DB_DIR", "var/minds")
     # Raw-memory backend behind the cue→episode interface (server/mind/mem.py):
-    # "lexical" (default, v3 behavior). Unknown names fail open to lexical.
+    # "lexical" (default, v3 behavior) or "embedding". Unknown names fail
+    # open to lexical.
     mem_backend: str = os.getenv("MIND_MEM_BACKEND", "lexical")
+    # Embedding backend: OpenAI-compatible /embeddings endpoint + model.
+    # bge-m3 needs no task prefixes (unlike nomic v1.5) — keep it that way.
+    embed_base_url: str = os.getenv("MIND_EMBED_BASE_URL", "http://localhost:1234/v1")
+    embed_model: str = os.getenv("MIND_EMBED_MODEL", "text-embedding-bge-m3")
+    # Cosine floor for semantic-only hits (bge-m3 measured on s13: relevant
+    # 0.55, best distractor 0.43 — the floor sits in the gap).
+    embed_min_sim: float = float(os.getenv("MIND_EMBED_MIN_SIM", "0.45"))
     # Target model window. 8k is the design floor (docs/architecture.md);
     # set to the backend's actual loaded context for tighter conditions.
     window: int = int(os.getenv("MIND_WINDOW", "8192"))

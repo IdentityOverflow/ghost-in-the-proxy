@@ -126,23 +126,47 @@ class _RecordingMem:
     """Fake backend: records hook calls, answers every content query."""
 
     name = "recording"
+    autocue = False
 
     def __init__(self):
         self.observed: list[tuple[str, int]] = []
         self.boundaries: list[tuple[str, str, int]] = []
         self.queries: list = []
 
-    def observe(self, session_id, event):
+    async def observe(self, session_id, event):
         self.observed.append((session_id, event.seq))
 
-    def boundary(self, session_id, reason, upto_seq):
+    async def boundary(self, session_id, reason, upto_seq):
         self.boundaries.append((session_id, reason, upto_seq))
 
-    def query(self, session_id, query, events):
+    async def query(self, session_id, query, events):
         from server.mind.mem import MemSpan
 
         self.queries.append(query)
         return [MemSpan(seq=1, role="user", text="canned span", score=1.0, backend=self.name)]
+
+
+def _fake_embedder(mem):
+    """Deterministic 2-d 'semantics': reptile-ish text points one way,
+    everything else the other. Patches mem._embed."""
+
+    async def embed(texts):
+        import numpy as np
+
+        out = []
+        for text in texts:
+            low = text.lower()
+            if any(w in low for w in ("tortoise", "reptile", "muriel")):
+                vec = [1.0, 0.0, 0.0]
+            elif "garden" in low:
+                vec = [0.0, 1.0, 0.0]
+            else:
+                vec = [0.0, 0.0, 1.0]
+            out.append(np.asarray(vec, dtype=np.float32))
+        return out
+
+    mem._embed = embed
+    return mem
 
 
 def test_mem_backend_swap_and_trajectory(store, tmp_path):
@@ -162,7 +186,7 @@ def test_mem_backend_swap_and_trajectory(store, tmp_path):
         await runtime.prepare(transcript, provider=None, model="m")
         assert [seq for _, seq in runtime.mem.observed] == [1, 2, 3]
 
-        out = runtime.resolve_recall(prepared.session_id, '{"query": "anything at all"}')
+        out = await runtime.resolve_recall(prepared.session_id, '{"query": "anything at all"}')
         assert "canned span" in out and "[seq 1, user, verbatim]" in out
         assert runtime.mem.queries[-1].trajectory  # trajectory stub supplied
         assert runtime.mem.queries[-1].kind == "content"
@@ -205,16 +229,106 @@ def test_mem_boundary_fires_on_fold(store, tmp_path, monkeypatch):
 
 
 def test_lexical_mem_matches_v3_ranking(store):
+    import asyncio
+
     from server.mind.mem import LexicalMem, MemQuery
 
     sid = store.create_session(None)
     store.append_event(sid, user("the tortoise Muriel lived in the stairwell"), source="client")
     store.append_event(sid, user("completely unrelated gardening chatter"), source="client")
     events = store.live_events(sid)
-    spans = LexicalMem().query(sid, MemQuery(text="Muriel stairwell tortoise"), events)
+    spans = asyncio.run(LexicalMem().query(sid, MemQuery(text="Muriel stairwell tortoise"), events))
     assert spans and spans[0].seq == 1 and spans[0].backend == "lexical"
     # order queries: honest empty, never a guess
-    assert LexicalMem().query(sid, MemQuery(text="x", kind="next", anchor_seq=1), events) == []
+    assert asyncio.run(
+        LexicalMem().query(sid, MemQuery(text="x", kind="next", anchor_seq=1), events)
+    ) == []
+
+
+def test_embedding_mem_semantic_reach_and_order(store, tmp_path):
+    import asyncio
+
+    from server.mind.mem import EmbeddingMem, MemQuery
+
+    cfg = config(db_dir=str(tmp_path / "minds"))
+    mem = _fake_embedder(EmbeddingMem(cfg, store))
+    sid = store.create_session(None)
+    store.append_event(sid, user("the tortoise Muriel lived in the stairwell"), source="client")
+    store.append_event(sid, user("completely unrelated gardening chatter"), source="client")
+    events = store.live_events(sid)
+
+    async def go():
+        for event in events:
+            await mem.observe(sid, event)
+        # zero lexical overlap, pure semantic hit — the s13 probe-A shape
+        spans = await mem.query(sid, MemQuery(text="who was the slow reptile?"), events)
+        assert spans and spans[0].seq == 1
+        assert spans[0].sim >= cfg.embed_min_sim
+        assert "Muriel" in spans[0].text
+        # hybrid: lexical-only material still reachable (verbatim words)
+        spans = await mem.query(sid, MemQuery(text="gardening chatter"), events)
+        assert spans and spans[0].seq == 2
+        # order comes from the log
+        nxt = await mem.query(sid, MemQuery(text="", kind="next", anchor_seq=1), events)
+        assert [span.seq for span in nxt] == [2]
+
+    asyncio.run(go())
+
+
+def test_embedding_mem_fails_open_to_lexical(store, tmp_path):
+    import asyncio
+
+    from server.mind.mem import EmbeddingMem, MemQuery
+
+    cfg = config(db_dir=str(tmp_path / "minds"))
+    mem = EmbeddingMem(cfg, store)
+
+    async def dead_embed(texts):
+        return None
+
+    mem._embed = dead_embed
+    sid = store.create_session(None)
+    store.append_event(sid, user("the tortoise Muriel lived in the stairwell"), source="client")
+    events = store.live_events(sid)
+
+    async def go():
+        await mem.observe(sid, events[0])  # embed fails; must not raise
+        spans = await mem.query(sid, MemQuery(text="Muriel stairwell"), events)
+        assert spans and spans[0].seq == 1 and spans[0].sim == 0.0  # lexical carried it
+
+    asyncio.run(go())
+
+
+def test_autocue_injects_folded_semantic_spans(store, tmp_path):
+    import asyncio
+
+    from server.mind.mem import EmbeddingMem
+    from server.mind.runtime import MindRuntime
+
+    cfg = config(db_dir=str(tmp_path / "minds"))
+    runtime = MindRuntime(cfg)
+    runtime.mem = _fake_embedder(EmbeddingMem(cfg, runtime.store))
+
+    async def go():
+        transcript = [
+            user("the tortoise Muriel lived in the stairwell"),
+            assistant("noted"),
+            user("tell me about gardening instead"),
+        ]
+        prepared = await runtime.prepare(transcript, provider=None, model="m")
+        # fold the tortoise turn out of view, then probe semantically
+        runtime.store.append_summary(prepared.session_id, 2, "earlier chatter")
+        transcript += [assistant("gardening is nice"), user("who was the slow reptile?")]
+        prepared2 = await runtime.prepare(transcript, provider=None, model="m")
+        system_text = prepared2.messages[0]["content"]
+        assert "Recalled verbatim" in system_text
+        assert "Muriel" in system_text
+        # on-topic lexical matches must NOT be auto-injected (sim filter):
+        transcript += [assistant("it was Muriel"), user("more about gardening chatter please")]
+        prepared3 = await runtime.prepare(transcript, provider=None, model="m")
+        assert "Recalled verbatim" not in prepared3.messages[0]["content"]
+
+    asyncio.run(go())
 
 
 def test_create_mem_backend_fails_open_to_lexical():
@@ -673,9 +787,13 @@ def test_router_keeps_belt_while_tools_in_flight(store):
 
 
 def test_recall_returns_verbatim_span(store):
+    import asyncio
     import json as _json
 
-    from server.mind.recall import resolve_recall
+    from server.mind.recall import resolve_recall as _async_resolve
+
+    def resolve_recall(events, args):
+        return asyncio.run(_async_resolve(events, args))
 
     sid = store.create_session(None)
     traceback = (

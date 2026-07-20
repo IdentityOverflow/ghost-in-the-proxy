@@ -81,12 +81,16 @@ DIGEST_NOTICE = (
 )
 
 
+RECALLED_SPAN_CHAR_CAP = 400
+
+
 def render_memory(
     summary_text: str,
     records: dict[str, list[dict[str, Any]]],
     episodes: list[tuple[int, int, str]],
     threads: ThreadsView | None = None,
     now: float | None = None,
+    recalled_spans: list | None = None,
 ) -> str:
     """Render the structured ledger + episodes (+ prose fallback) as the
     memory section of the system prompt. Empty sections are omitted. With a
@@ -150,6 +154,22 @@ def render_memory(
         sections.append(
             "### Recalled (dormant memory cued by the latest message)\n" + "\n".join(lines)
         )
+    if recalled_spans:
+        # Raw-memory rescue (s13): folded verbatim spans the Mem backend
+        # matched semantically. Provenance-marked and pointed — the baseline
+        # failed with the same material merely present in context.
+        lines = []
+        for span in sorted(recalled_spans, key=lambda s: s.seq):
+            text = span.text
+            if len(text) > RECALLED_SPAN_CHAR_CAP:
+                text = text[:RECALLED_SPAN_CHAR_CAP] + " …[truncated]"
+            # seq provenance rendered on purpose: order questions are only
+            # answerable if the model can SEE the sequence numbers.
+            lines.append(f"- [seq {span.seq}, verbatim] {span.role}: {text}")
+        sections.append(
+            "### Recalled verbatim (raw memory matched to the latest message)\n"
+            + "\n".join(lines)
+        )
     if episodes:
         lines = [f"- {summary}" for _, _, summary in episodes]
         sections.append("### Earlier events\n" + "\n".join(lines))
@@ -209,6 +229,7 @@ def assemble(
     episodes: list[tuple[int, int, str]] | None = None,
     threads: ThreadsView | None = None,
     now: float | None = None,
+    recalled_spans: list | None = None,
 ) -> Workspace:
     reserve = max(int(config.window * config.reserve_fraction), 1024)
     # chars/4 underestimates real tokenizers by ~20% (measured against
@@ -220,7 +241,10 @@ def assemble(
     if client_system:
         system_parts.append(client_system)
     summary_upto, summary_text = (summary or (0, ""))
-    memory = render_memory(summary_text, records or {}, episodes or [], threads, now=now)
+    memory = render_memory(
+        summary_text, records or {}, episodes or [], threads, now=now,
+        recalled_spans=recalled_spans,
+    )
     if memory:
         system_parts.append(memory)
     system_content = "\n\n".join(system_parts)

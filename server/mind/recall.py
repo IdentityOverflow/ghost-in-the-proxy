@@ -49,7 +49,7 @@ def is_recall_call(call: dict[str, Any]) -> bool:
     return call.get("function", {}).get("name") == "recall"
 
 
-def resolve_recall(
+async def resolve_recall(
     events: list[Event],
     arguments_json: str,
     backend: MemBackend | None = None,
@@ -69,7 +69,7 @@ def resolve_recall(
         return "recall error: empty query"
 
     mem = backend if backend is not None else LexicalMem()
-    spans = mem.query(
+    spans = await mem.query(
         session_id,
         MemQuery(text=query, trajectory=trajectory or [], k=MAX_RESULTS),
         events,
