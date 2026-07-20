@@ -10,8 +10,9 @@ from .s8_interrupt import SCENARIO as S8
 from .s9_verbatim import SCENARIO as S9
 from .s10_tool_tax import SCENARIO as S10
 from .s11_time import SCENARIO as S11
+from .s12_semantic_callback import SCENARIO as S12
 
-ALL_SCENARIOS: list[Scenario] = [S1, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11]
+ALL_SCENARIOS: list[Scenario] = [S1, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11, S12]
 
 
 def get_scenarios(ids: list[str] | None = None) -> list[Scenario]:

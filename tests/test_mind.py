@@ -90,6 +90,18 @@ def test_same_client_system_change_still_continues(store):
     assert recon2.session_id == recon1.session_id
 
 
+def test_s12_zero_overlap_is_certified_by_the_real_tokenizer():
+    # The s12 discriminator's premise: probe A shares NO content words with
+    # the aside, so lexical cue and recall search have nothing to grip. If
+    # scenario wording drifts, this fails before a live run wastes a gate.
+    from evals.scenarios.s12_semantic_callback import ASIDE, PROBE_LEXICAL, PROBE_SEMANTIC
+    from server.mind.dynamics import tokenize
+
+    assert tokenize(ASIDE) & tokenize(PROBE_SEMANTIC) == set()
+    # The control probe must stay lexically reachable (cue needs >=2 hits).
+    assert len(tokenize(ASIDE) & tokenize(PROBE_LEXICAL)) >= 2
+
+
 def test_truncation_stop_button(store):
     recon1, reply_seq = play_turn(store, [user("explain quantum physics")], "It is a long story about particles and waves")
 
