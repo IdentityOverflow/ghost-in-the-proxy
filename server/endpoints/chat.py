@@ -33,6 +33,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # scope the client's tool pack, and offer the recall tool (v3).
     mind = get_mind_runtime()
     session_id: str | None = None
+    recall_offered = False
     # Fake clock (v4 eval harness): trusted only when explicitly enabled,
     # otherwise clients could spoof the mind's sense of time.
     clock: float | None = None
@@ -50,16 +51,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             )
             outgoing_messages = prepared.messages
             session_id = prepared.session_id
+            recall_offered = prepared.recall_offered
             if prepared.tools_scoped:
                 tools_out = prepared.tools or []
-                if req.stream:
-                    # Recall interception exists only in the non-stream path;
-                    # offering it on a stream would leak an unknown tool call
-                    # to the client mid-stream.
-                    tools_out = [
-                        t for t in tools_out
-                        if t.get("function", {}).get("name") != "recall"
-                    ]
                 if tools_out:
                     payload["tools"] = tools_out
                 else:
@@ -74,28 +68,109 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         payload["model"] = target_model
 
     if req.stream:
+        recall_active = (
+            mind is not None
+            and session_id is not None
+            and mind_config.recall_enabled
+            and recall_offered
+        )
+
         async def sse() -> AsyncIterator[bytes]:
-            collector = _DeltaCollector()
+            # Streaming recall (v4.1): a tool call already forwarded cannot be
+            # intercepted, so while the reply could still turn out to be a
+            # pure `recall` call we HOLD chunks instead of yielding them. The
+            # hold ends the moment the stream shows content or a non-recall
+            # tool name (flush held bytes, then transparent passthrough —
+            # mixed batches pass through untouched, symmetric with the
+            # non-stream path). A stream that ends while still held is a pure
+            # recall reply: resolve proxy-side, re-query streaming, repeat.
+            # The client never sees the exchange and it never enters the
+            # event store (deliberation, not conversation truth). Cost for
+            # ordinary content replies: delayed by roughly one role-only
+            # chunk before the hold resolves.
+            stream_payload = payload
+            hops = 0
             complete = False
+            # Collector of the bytes the client actually saw; recall
+            # exchanges are held back, never forwarded, never recorded.
+            forwarded: _DeltaCollector | None = None
             try:
-                async for raw in provider.chat_completions_stream(payload):
-                    collector.feed(raw)
-                    # Check for client disconnect
-                    if await request.is_disconnected():
-                        break
-                    yield raw
-                else:
-                    complete = True
+                while True:
+                    collector = _DeltaCollector()
+                    held: list[bytes] | None = [] if recall_active else None
+                    if held is None:
+                        forwarded = collector
+                    complete = False
+                    async for raw in provider.chat_completions_stream(stream_payload):
+                        collector.feed(raw)
+                        # Check for client disconnect
+                        if await request.is_disconnected():
+                            break
+                        if held is None:
+                            yield raw
+                            continue
+                        # A name still streaming in fragments ("re", "call")
+                        # must not read as a foreign tool: only a name that
+                        # can no longer become "recall" ends the hold.
+                        if collector.has_content() or any(
+                            not (name == "recall" or "recall".startswith(name))
+                            for name in collector.tool_names()
+                        ):
+                            for held_raw in held:
+                                yield held_raw
+                            held = None
+                            forwarded = collector
+                            yield raw
+                        else:
+                            held.append(raw)
+                    else:
+                        complete = True
+                    if not complete or held is None:
+                        break  # disconnect, or a fully-forwarded stream
+                    # Stream ended while held: pure-recall reply (or nothing).
+                    message = collector.message()
+                    calls = (message or {}).get("tool_calls") or []
+                    all_recall = calls and all(
+                        call["function"]["name"] == "recall" for call in calls
+                    )
+                    if all_recall and hops < mind_config.recall_max_hops:
+                        hops += 1
+                        followup = list(stream_payload["messages"]) + [message]
+                        for call in calls:
+                            content = mind.resolve_recall(
+                                session_id, call.get("function", {}).get("arguments") or "{}"
+                            )
+                            followup.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": call.get("id") or f"recall-{hops}",
+                                    "content": content,
+                                }
+                            )
+                        print(
+                            f"[mind] recall hop {hops} (stream): {len(calls)} call(s)",
+                            flush=True,
+                        )
+                        stream_payload = {**stream_payload, "messages": followup}
+                        continue
+                    if all_recall:
+                        print("[mind] recall hop limit reached; passing through", flush=True)
+                    # Held but not interceptable (hop limit, or an empty
+                    # reply): flush verbatim so the wire stays truthful.
+                    for held_raw in held:
+                        yield held_raw
+                    forwarded = collector
+                    break
             except asyncio.CancelledError:
                 # Client disconnected during streaming
                 raise
             finally:
                 # We are the stream: record exactly what went out, even on
                 # interrupt (complete=False -> provisional truncated reply).
-                if mind is not None and session_id is not None and collector.message():
-                    mind.observe_reply(
-                        session_id, collector.message(), complete=complete, ts=clock
-                    )
+                if mind is not None and session_id is not None and forwarded is not None:
+                    message = forwarded.message()
+                    if message is not None:
+                        mind.observe_reply(session_id, message, complete=complete, ts=clock)
         return StreamingResponse(sse(), media_type="text/event-stream")
 
     try:
@@ -149,11 +224,18 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
 
 class _DeltaCollector:
-    """Accumulate assistant content from raw SSE chunks (tolerant parser)."""
+    """Accumulate an assistant message from raw SSE chunks (tolerant parser).
+
+    Collects content AND tool_call deltas so (a) a streamed tool-call reply
+    is recorded in the event store in the same shape as a non-stream one,
+    and (b) the recall interceptor can see what the model is doing before
+    any of it is forwarded.
+    """
 
     def __init__(self):
         self._buffer = b""
         self._content: list[str] = []
+        self._tool_calls: dict[int, dict] = {}
 
     def feed(self, raw: bytes) -> None:
         self._buffer += raw
@@ -172,11 +254,43 @@ class _DeltaCollector:
             piece = delta.get("content")
             if piece:
                 self._content.append(piece)
+            for fragment in delta.get("tool_calls") or []:
+                if not isinstance(fragment, dict):
+                    continue
+                call = self._tool_calls.setdefault(
+                    fragment.get("index", 0),
+                    {"id": None, "type": "function", "function": {"name": "", "arguments": ""}},
+                )
+                if fragment.get("id"):
+                    call["id"] = fragment["id"]
+                if fragment.get("type"):
+                    call["type"] = fragment["type"]
+                function = fragment.get("function") or {}
+                if function.get("name"):
+                    call["function"]["name"] += function["name"]
+                if function.get("arguments"):
+                    call["function"]["arguments"] += function["arguments"]
+
+    def has_content(self) -> bool:
+        return bool(self._content)
+
+    def tool_names(self) -> list[str]:
+        return [
+            call["function"]["name"]
+            for _, call in sorted(self._tool_calls.items())
+            if call["function"]["name"]
+        ]
 
     def message(self) -> dict | None:
-        if not self._content:
+        if not self._content and not self._tool_calls:
             return None
-        return {"role": "assistant", "content": "".join(self._content)}
+        message: dict = {"role": "assistant", "content": "".join(self._content) or None}
+        if self._tool_calls:
+            message["tool_calls"] = [
+                {**call, "id": call["id"] or f"call_{index}"}
+                for index, call in sorted(self._tool_calls.items())
+            ]
+        return message
 
 
 def _error_body(error: httpx.HTTPStatusError):

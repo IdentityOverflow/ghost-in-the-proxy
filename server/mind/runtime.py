@@ -42,6 +42,9 @@ class PreparedRequest:
     # None means "leave the client's tools untouched".
     tools: list[dict[str, Any]] | None = None
     tools_scoped: bool = False
+    # Whether the recall tool is in `tools` this request — the streaming
+    # path needs to know before the first chunk whether to hold-and-decide.
+    recall_offered: bool = False
 
 
 class MindRuntime:
@@ -159,6 +162,7 @@ class MindRuntime:
             workspace.messages,
             tools=out_tools if tools_scoped else None,
             tools_scoped=tools_scoped,
+            recall_offered=recall_offered,
         )
 
     def resolve_recall(self, session_id: str, arguments_json: str) -> str:
