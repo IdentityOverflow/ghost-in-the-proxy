@@ -252,7 +252,10 @@ FIXED.update(
             "correction-mid", 47, _mention("corrected budget", r"14[,.\s]?500", r"14\.5"),
             # Certified against a live false pass: "Your hard ceiling is
             # **12,000 euros** (you mentioned 14,500 once...)".
-            _never("stale budget as current", r"(is|remains|still|of)\s+\*{0,2}€?\s?12[,.\s]?000"),
+            _never(
+                "stale budget as current",
+                r"(ceiling|cap|budget|limit)[^.]{0,40}\b(is|remains)\s+\*{0,2}€?\s?12[,.\s]?000",
+            ),
         ),
         99: _probe(
             99,
@@ -286,8 +289,11 @@ FIXED.update(
         ),
         118: _probe(
             118,
-            "I'm ordering a name decal for the van's back door. Spell out the name "
-            "for me so I get it right.",
+            # Deliberately no "back door" here: that phrase is the cue of the
+            # fox-drawing probe ten turns later, and a fresh distractor would
+            # turn a memory probe into a disambiguation probe.
+            "I'm ordering a name decal for the van. Spell out the name for me so "
+            "I get it right.",
             "fact-far", 1, _mention("van name", r"juniper"),
         ),
         120: _probe(

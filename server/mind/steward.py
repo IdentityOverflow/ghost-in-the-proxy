@@ -21,7 +21,7 @@ from typing import Any
 
 from .assembler import estimate_tokens
 from .config import MindConfig
-from .ledger import ApplyReport, LedgerState, Record, apply_ops, replay
+from .ledger import ApplyReport, LedgerState, Record, apply_ops, normalize_key, replay
 from .mem import MemBackend
 from .relevance import score_texts
 from .store import Event, MindStore, content_text
@@ -370,6 +370,7 @@ async def _fold_pass(
 
 
 NEAR_DUPLICATE_SIM = 0.88
+SAME_SUBJECT_SIM = 0.72  # enough when one key's words contain the other's
 
 
 async def _merge_near_duplicates(
@@ -377,20 +378,27 @@ async def _merge_near_duplicates(
 ) -> int:
     """Turn an `add` that restates an existing entry into an `update` of it.
 
-    Key-equality de-dup (ledger.py) misses paraphrased keys — observed live:
-    "Teodor: mechanic who quoted 640 euros" then "timing chain quote: Teodor
-    quoted 640 euros" as two facts. With a semantic backend the restatement
-    is recognisable; without one this is a no-op. Rewrites ops in place.
+    Key-equality de-dup (ledger.py) misses paraphrased keys and misses KIND
+    entirely — both observed live: "Teodor: mechanic who quoted 640 euros"
+    then "timing chain quote: ..." as two facts; and a budget recorded as a
+    DECISION (12,000) later corrected by adding a FACT (14,500), leaving two
+    contradicting entries the model then chose between at random. Facts and
+    decisions are compared together (the ledger aliases their value fields);
+    commitments only among themselves. Needs a semantic backend; without one
+    this is a no-op. Rewrites ops in place.
     """
     if mem is None:
         return 0
     merged = 0
     for op in ops:
-        if op.get("op") != "add" or op.get("kind") not in ("fact", "decision", "commitment"):
+        kind = op.get("kind")
+        if op.get("op") != "add" or kind not in ("fact", "decision", "commitment"):
             continue
-        existing = [r for r in state.by_kind(op["kind"]) if r.is_open]
+        family = ("commitment",) if kind == "commitment" else ("fact", "decision")
+        existing = [r for r in state.records.values() if r.kind in family and r.is_open]
         if not existing:
             continue
+        key = str(op.get("subject") or op.get("topic") or op.get("statement") or "")
         text = " ".join(
             str(op.get(name, ""))
             for name in ("subject", "topic", "statement", "claim", "choice", "trigger")
@@ -399,11 +407,24 @@ async def _merge_near_duplicates(
         sims = await mem.text_sims(text, [record.text() for record in existing])
         if not sims:
             return merged  # no semantic signal available (lexical backend, outage)
-        best = max(range(len(existing)), key=lambda index: sims[index])
-        if sims[best] >= NEAR_DUPLICATE_SIM:
+        key_words = set(normalize_key(key).split())
+
+        def threshold(record: Record) -> float:
+            other = set(record.key.split())
+            related = bool(key_words and other) and (key_words <= other or other <= key_words)
+            return SAME_SUBJECT_SIM if related else NEAR_DUPLICATE_SIM
+
+        best = max(range(len(existing)), key=lambda index: sims[index] - threshold(existing[index]))
+        if sims[best] >= threshold(existing[best]):
+            target = existing[best]
             op["op"] = "update"
-            op["id"] = existing[best].id
+            op["id"] = target.id
             op.pop("kind", None)
+            if target.kind != kind:
+                # Keep the target's own key (its identity in its kind); the
+                # value crosses over through the ledger's field aliases.
+                for name in ("subject", "topic"):
+                    op.pop(name, None)
             merged += 1
     return merged
 
