@@ -113,7 +113,13 @@ def assemble(
     now: float | None = None,
     tools_tokens: int = 0,
     scale: float = DEFAULT_TOKEN_SCALE,
+    volatile_text: str = "",
+    fold_boundaries: list[int] | None = None,
 ) -> Workspace:
+    """`memory_text` rides in the system message; `volatile_text` (per-turn
+    memory, phase A) is prefixed to the latest user message so everything
+    before it stays byte-identical between folds and the backend's prefix
+    cache keeps working."""
     workspace_budget, hard_limit = token_budgets(config, tools_tokens, scale)
 
     system_parts = []
@@ -148,6 +154,8 @@ def assemble(
     # alternation is untouched.
     if now is not None:
         render = _mark_gaps(config, events, render)
+    if volatile_text:
+        render = _attach_notes(events, render, volatile_text)
 
     blocks = _texture_blocks(events)
 
@@ -182,6 +190,33 @@ def assemble(
     while start_index > 0 and blocks[start_index - 1][-1].seq > covered_upto:
         start_index -= 1
         chosen.insert(0, blocks[start_index])
+
+    if fold_boundaries is not None:
+        # The cache contract (phase A): the texture may only START at a fold
+        # boundary. Newest-first filling evicts one covered block per turn —
+        # the prompt's second message changes every turn and the backend's
+        # prefix cache never survives (measured: 13% reuse). Pinning the start
+        # to the earliest fold boundary that fits moves it only when a fold
+        # lands, which is when the system message changes anyway; fold-ahead
+        # leaves the headroom that keeps it still in between.
+        starts = [0] + sorted(boundary for boundary in fold_boundaries if boundary <= covered_upto)
+        for boundary in starts:
+            index = next((i for i, block in enumerate(blocks) if block[0].seq > boundary), len(blocks))
+            candidate = blocks[index:]
+            if not candidate:
+                continue
+            fits = system_cost + sum(block_cost(block) for block in candidate) <= workspace_budget
+            if fits or boundary == starts[-1]:
+                # Every boundary is <= covered_upto, so no uncovered event is
+                # ever dropped here; the last one may run over budget, exactly
+                # like the uncovered extension above.
+                chosen = list(candidate)
+                break
+        while chosen and chosen[0][0].role != "user":
+            index = len(blocks) - len(chosen)
+            if index == 0:
+                break
+            chosen.insert(0, blocks[index - 1])
 
     # HARD GUARD: the request must fit the window, whatever it costs. Evict
     # from the old end (keeping the opening on a user block), never the
@@ -244,7 +279,8 @@ def assemble(
         desired_from_seq=desired_from_seq,
         estimated_tokens=system_cost
         + sum(estimate_tokens(render[event.seq]) for event in texture_events),
-        memory_tokens=estimate_tokens(memory_text) if memory_text else 0,
+        memory_tokens=(estimate_tokens(memory_text) if memory_text else 0)
+        + (estimate_tokens(volatile_text) if volatile_text else 0),
         system_tokens=system_cost,
         budget_tokens=workspace_budget,
         hard_limit_tokens=hard_limit,
@@ -267,6 +303,22 @@ def _shrink_block(block: list[Event], render: dict[int, Any], excess_tokens: int
         f"ask the user to send it in parts, or call recall(...) for a specific passage]…\n{text[-tail:]}"
     )
     render[largest.seq] = {**message, "content": cut}
+
+
+def _attach_notes(events: list[Event], render: dict[int, Any], notes: str) -> dict[int, Any]:
+    """Prefix the per-turn memory block to the LATEST user message (render
+    only — the store never sees it, so reconciliation is untouched). During a
+    tool loop the latest user message is unchanged, and so is the block."""
+    target = next((event for event in reversed(events) if event.role == "user"), None)
+    if target is None:
+        return render
+    message = render[target.seq]
+    content = message.get("content")
+    if isinstance(content, str):
+        render[target.seq] = {**message, "content": f"{notes}\n\n{content}"}
+    elif isinstance(content, list):
+        render[target.seq] = {**message, "content": [{"type": "text", "text": notes}] + content}
+    return render
 
 
 def _mark_gaps(

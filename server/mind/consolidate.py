@@ -75,7 +75,7 @@ async def consolidate_once(
 
 async def _condense(config: MindConfig, provider: Any, model: str, notes: list[str]) -> str:
     payload = {
-        "model": config.extraction_model or model,
+        "model": model,
         "messages": [
             {"role": "system", "content": CONSOLIDATE_SYSTEM},
             {"role": "user", "content": "\n".join(f"{i}. {note}" for i, note in enumerate(notes, 1))},

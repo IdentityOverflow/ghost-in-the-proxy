@@ -32,7 +32,7 @@ from .consolidate import consolidate_once
 from .dynamics import ThreadState, admitted_threads, cued_threads, update_dynamics
 from .ledger import LedgerState, replay
 from .mem import MemQuery, create_mem_backend
-from .memory_view import ThreadsView, memory_budget, render_memory
+from .memory_view import ThreadsView, memory_budget, render_memory, render_memory_parts
 from .metrics import emit
 from .perception import reconcile, resolve_session
 from .recall import RECALL_TOOL, resolve_recall
@@ -101,6 +101,9 @@ class MindRuntime:
         self._context: dict[str, _SessionContext] = {}
         self._background: set[asyncio.Task] = set()
         self._maintaining: dict[str, asyncio.Task] = {}
+        # Previous outgoing request per session, serialized: the shared prefix
+        # with the next one is what a backend's KV cache could reuse.
+        self._last_request: dict[str, str] = {}
         # Real tokens per estimated token, learned from usage.prompt_tokens.
         # Keyed by MODEL: it is a property of the tokenizer, not the session.
         self._scale: dict[str, float] = {}
@@ -235,10 +238,22 @@ class MindRuntime:
             ),
             flush=True,
         )
+        serialized = json.dumps(workspace.messages, ensure_ascii=False)
+        previous = self._last_request.get(session_id, "")
+        shared = 0
+        for left, right in zip(previous, serialized):
+            if left != right:
+                break
+            shared += 1
+        self._last_request[session_id] = serialized
         emit(
             "request",
             session=session_id,
             outcome=recon.outcome,
+            request_chars=len(serialized),
+            # Share of THIS request already seen as a prefix of the last one —
+            # an upper bound on KV-cache reuse (0 on the first turn).
+            prefix_reuse=round(shared / len(serialized), 3) if serialized else 0.0,
             live_events=len(events),
             workspace_tokens=workspace.estimated_tokens,
             memory_tokens=workspace.memory_tokens,
@@ -287,11 +302,7 @@ class MindRuntime:
         tools_tokens = estimate_tokens(out_tools + [RECALL_TOOL]) if (out_tools or state.covered_upto) else 0
         scale = self._scale.get(model, DEFAULT_TOKEN_SCALE)
         budget, _hard = token_budgets(self.config, tools_tokens, scale)
-        memory_text = await render_memory(
-            self.config,
-            state,
-            consolidations,
-            threads,
+        render_args = dict(
             cue=_last_user_text(events),
             mem=self.mem,
             budget_tokens=memory_budget(self.config, budget),
@@ -299,6 +310,16 @@ class MindRuntime:
             recalled_spans=recalled,
             seq_ts={event.seq: event.ts for event in events if event.ts},
         )
+        volatile_text = ""
+        if self.config.memory_placement == "split":
+            parts = await render_memory_parts(
+                self.config, state, consolidations, threads, **render_args
+            )
+            memory_text, volatile_text = parts.stable, parts.volatile
+        else:
+            memory_text = await render_memory(
+                self.config, state, consolidations, threads, **render_args
+            )
         workspace = assemble(
             self.config,
             self.store.get_client_system(session_id),
@@ -308,6 +329,12 @@ class MindRuntime:
             now=clock,
             tools_tokens=tools_tokens,
             scale=scale,
+            volatile_text=volatile_text,
+            fold_boundaries=(
+                [fold["span_to"] for fold in self.store.live_folds(session_id)]
+                if self.config.memory_placement == "split"
+                else None
+            ),
         )
         return _Scene(session_id, workspace, state, threads, len(recalled or []))
 
@@ -391,6 +418,29 @@ class MindRuntime:
             print(f"[mind] maintenance failed ({error!r})", flush=True)
             emit("maintenance_error", session=session_id, error=repr(error)[:300])
 
+    def _extraction_target(self, provider: Any, model: str) -> tuple[Any, str]:
+        """Who runs steward/consolidation calls. Default: the conversation's
+        own provider and model. MIND_EXTRACTION_MODEL may name another model
+        on the same provider, a MODEL_MAP alias, or "provider:model" — a
+        DIFFERENT backend matters on a single-slot local server (LM Studio),
+        where a background fold otherwise queues ahead of the user's next
+        message and evicts the conversation's KV cache (measured live: 45-85 s
+        stalls)."""
+        target = self.config.extraction_model
+        if not target:
+            return provider, model
+        from ..routing.router import PROVIDERS, resolve_provider_and_model
+        from ..config import settings
+
+        name, _, rest = target.partition(":")
+        if rest and name in PROVIDERS:
+            return PROVIDERS[name], rest
+        if target in settings.model_map:
+            mapped_provider, mapped_model = resolve_provider_and_model(target)
+            if mapped_provider is not None:
+                return mapped_provider, mapped_model
+        return provider, target
+
     async def drain(self) -> None:
         """Wait for background maintenance (tests, graceful shutdown)."""
         while self._background:
@@ -410,6 +460,7 @@ class MindRuntime:
         before = replay(self.store.live_folds(session_id))
         outcome = FoldOutcome()
         error_text = ""
+        provider, model = self._extraction_target(provider, model)
         try:
             outcome = await run_steward(
                 self.config, self.store, session_id, events, provider, model, upto,

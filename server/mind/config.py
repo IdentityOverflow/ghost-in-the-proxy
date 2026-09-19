@@ -52,6 +52,11 @@ class MindConfig(BaseModel):
     # The memory section's share of the workspace budget, with absolute
     # bounds: small windows still get a usable scene, big windows do not get
     # a bigger default scene (abundance causes dilution).
+    # Where per-turn memory goes. "split": stable memory in the system
+    # message, per-turn memory (clock, cue-recalled records, active threads)
+    # in a block on the latest user message — the backend's KV cache survives
+    # between folds. "system": everything in the system message (pre-phase-A).
+    memory_placement: str = os.getenv("MIND_MEMORY_PLACEMENT", "split")
     memory_fraction: float = float(os.getenv("MIND_MEMORY_FRACTION", "0.35"))
     memory_min_tokens: int = int(os.getenv("MIND_MEMORY_MIN_TOKENS", "900"))
     memory_max_tokens: int = int(os.getenv("MIND_MEMORY_MAX_TOKENS", "4000"))

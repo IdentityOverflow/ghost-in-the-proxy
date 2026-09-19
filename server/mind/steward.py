@@ -346,7 +346,7 @@ async def _fold_pass(
             ),
         },
     ]
-    extraction_model = config.extraction_model or model
+    extraction_model = model  # the runtime already resolved MIND_EXTRACTION_MODEL
     ops: list[dict[str, Any]] = []
     episode = ""
     kind = "steward"

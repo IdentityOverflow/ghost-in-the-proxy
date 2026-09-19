@@ -340,13 +340,16 @@ def test_autocue_injects_folded_semantic_spans(store, tmp_path):
         runtime.store.append_fold(prepared.session_id, 1, 2, [], "earlier chatter")
         transcript += [assistant("gardening is nice"), user("who was the slow reptile?")]
         prepared2 = await runtime.prepare(transcript, provider=None, model="m")
-        system_text = prepared2.messages[0]["content"]
-        assert "Recalled verbatim" in system_text
-        assert "Muriel" in system_text
+        # Per-turn memory rides on the latest user message (phase A), never in
+        # the system message — that is what keeps the prefix cacheable.
+        notes = prepared2.messages[-1]["content"]
+        assert "Recalled verbatim" in notes and "Muriel" in notes
+        assert notes.endswith("who was the slow reptile?")
+        assert "Muriel" not in prepared2.messages[0]["content"]
         # on-topic lexical matches must NOT be auto-injected (sim filter):
         transcript += [assistant("it was Muriel"), user("more about gardening chatter please")]
         prepared3 = await runtime.prepare(transcript, provider=None, model="m")
-        assert "Recalled verbatim" not in prepared3.messages[0]["content"]
+        assert all("Recalled verbatim" not in str(m["content"]) for m in (prepared3.messages[0], prepared3.messages[-1]))
 
     asyncio.run(go())
 

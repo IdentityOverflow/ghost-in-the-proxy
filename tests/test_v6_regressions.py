@@ -471,7 +471,7 @@ def test_request_does_not_hang_behind_stuck_maintenance(tmp_path, monkeypatch):
             runtime.prepare(transcript + [reply, message("user", "next")], None, "m"), 2
         )
         assert following.session_id == sid
-        assert following.messages[-1]["content"] == "next"
+        assert following.messages[-1]["content"].endswith("next")
         assert len(calls) == 1  # the request did not start a rival steward
         release.set()
         await runtime.drain()
@@ -521,3 +521,97 @@ def test_multi_part_cue_scores_each_clause():
     assert _clauses("What size was the fresh water tank I got?") == []
     scored = asyncio.run(score_texts(cue, ["electrical system: 280Ah LiFePO4", "paint: green"], ClauseMem()))
     assert scored[0].matched and not scored[1].matched
+
+
+def test_split_memory_keeps_the_system_message_stable_across_turns(tmp_path):
+    # The cache contract: between folds the system message must be byte-
+    # identical whatever the user says and whatever the clock reads; all
+    # per-turn memory sits in a marked block on the LATEST user message only.
+    from server.mind.config import MindConfig
+    from server.mind.runtime import MindRuntime
+    from server.mind.memory_view import NOTES_OPEN
+
+    runtime = MindRuntime(MindConfig(enabled=True, db_dir=str(tmp_path), mem_backend="lexical",
+                                     memory_placement="split"))
+
+    async def go():
+        transcript = [message("system", "You are Sable."), message("user", "my dog is called Biscuit"),
+                      message("assistant", "noted"), message("user", "and the van is Juniper")]
+        first = await runtime.prepare(transcript, None, "m", now=1_800_000_000.0)
+        sid = first.session_id
+        runtime.store.append_fold(sid, 1, 2, [
+            {"op": "add", "kind": "fact", "subject": "dog name", "claim": "Biscuit", "core": True},
+            {"op": "add", "kind": "fact", "subject": "favourite biscuit", "claim": "ginger nuts"},
+            {"op": "add", "kind": "commitment", "statement": "remind about the vet", "trigger": "in May"},
+        ], "They met the dog.")
+        systems, lasts = [], []
+        for turn, text in enumerate(["what biscuit do I like?", "tell me about sails", "the dog again?"]):
+            transcript += [message("assistant", f"reply {turn}"), message("user", text)]
+            prepared = await runtime.prepare(transcript, None, "m", now=1_800_000_000.0 + 3600 * (turn + 1))
+            systems.append(prepared.messages[0]["content"])
+            lasts.append(prepared.messages[-1]["content"])
+            # older user messages never carry a block
+            assert all(NOTES_OPEN not in str(m["content"]) for m in prepared.messages[1:-1])
+        assert systems[0] == systems[1] == systems[2]
+        assert "Biscuit" in systems[0] and "remind about the vet" in systems[0]
+        assert "Current time" not in systems[0]
+        assert all(NOTES_OPEN in last and "Current time" in last for last in lasts)
+        # non-core facts are per-turn material: on the user message, never in the system
+        assert "ginger nuts" in lasts[0] and "ginger nuts" not in systems[0]
+
+    asyncio.run(go())
+
+
+def test_split_parts_respect_the_shared_budget():
+    from server.mind.ledger import LedgerState, apply_ops
+    from server.mind.memory_view import estimate_tokens, render_memory_parts
+    from server.mind.config import MindConfig
+
+    state = LedgerState()
+    apply_ops(state, [{"op": "add", "kind": "fact", "subject": f"thing {i}", "claim": "detail " * 30,
+                       "core": i % 2 == 0} for i in range(120)]
+              + [{"op": "add", "kind": "commitment", "statement": f"promise {i} " + "x " * 20} for i in range(40)],
+              fold=1, span_to=2)
+    for budget in (900, 1600, 4000):
+        parts = asyncio.run(render_memory_parts(MindConfig(), state, [], None, "thing 7 detail", None, budget, now=1_800_000_000.0))
+        assert estimate_tokens(parts.stable) + estimate_tokens(parts.volatile) <= budget
+        assert "Open commitments" in parts.stable
+
+
+def test_triggered_commitment_is_nudged_only_on_real_trigger_match():
+    # Live finding: "payday is this friday" did not surface "order copper
+    # rivets — on payday"; the item was merely listed. The per-turn notes now
+    # say it plainly — but one shared common word must not fire a reminder.
+    from server.mind.ledger import LedgerState, apply_ops
+    from server.mind.memory_view import render_memory_parts
+    from server.mind.config import MindConfig
+
+    state = LedgerState()
+    apply_ops(state, [
+        {"op": "add", "kind": "commitment", "statement": "remind Noor to order copper rivets", "trigger": "on payday"},
+        {"op": "add", "kind": "commitment", "statement": "reseal the roof vent", "trigger": "before the first rain test"},
+    ], fold=1, span_to=2)
+
+    def notes(cue):
+        return asyncio.run(render_memory_parts(MindConfig(), state, [], None, cue, None, 1600)).volatile
+
+    fired = notes("ugh long week. payday is this friday at least")
+    assert "bring it up now" in fired and "copper rivets" in fired and "roof vent" not in fired.split("bring it up now")[1]
+    assert "bring it up now" not in notes("I failed my driving test today")
+    assert "roof vent" in notes("doing the first rain test on saturday").split("bring it up now")[1]
+
+
+def test_extraction_target_routes_to_another_provider(tmp_path, monkeypatch):
+    from server.mind.config import MindConfig
+    from server.mind.runtime import MindRuntime
+    from server.routing import router
+
+    remote, local = object(), object()
+    monkeypatch.setitem(router.PROVIDERS, "openrouter", remote)
+    runtime = MindRuntime(MindConfig(enabled=True, db_dir=str(tmp_path), mem_backend="lexical",
+                                     extraction_model="openrouter:google/gemma-4-26b-a4b-it"))
+    assert runtime._extraction_target(local, "gemma-local") == (remote, "google/gemma-4-26b-a4b-it")
+    runtime.config.extraction_model = "smaller-local-model"
+    assert runtime._extraction_target(local, "gemma-local") == (local, "smaller-local-model")
+    runtime.config.extraction_model = None
+    assert runtime._extraction_target(local, "gemma-local") == (local, "gemma-local")
