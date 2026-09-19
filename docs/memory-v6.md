@@ -83,7 +83,9 @@ applies them deterministically. Omission means unchanged.
   field is dropped and counted; the rest commits. (The abandoned hardening
   pass rejected whole folds and then failed the same fold forever.)
 - Adds are de-duplicated in the runtime: same kind + same normalized key as
-  a live record becomes an update.
+  a live record becomes an update; with a semantic backend, a restatement
+  merges by cosine too — across fact/decision kinds, whose value fields
+  (`claim`/`choice`) are aliases, because the model knows ids, not kinds.
 - `core: true` marks identity-level knowledge (names, hard constraints, key
   dates, allergies) — the profile tier that always renders.
 - The steward sees a SLICE of the ledger rendered as compact id'd lines:
@@ -91,7 +93,9 @@ applies them deterministically. Omission means unchanged.
   relevance to the fold span (lexical + embedding when available), under a
   fixed token budget. Input and output no longer grow with the conversation.
 - JSON-schema constrained decoding is requested when the backend supports
-  it; fallback is a plain-text episode-only fold (no ops), never a rewrite.
+  it — a strict discriminated union per op shape. An unusable proposal is
+  salvaged op by op, then retried unconstrained; the last resort is a
+  plain-text episode-only fold (no ops), never a rewrite.
 
 ## 3. Bounded rendering
 
@@ -121,18 +125,23 @@ turn, by the recall tool, by the auto-cue channel.
 schemas + reserve for the reply) must fit the window. If not: uncovered old
 texture is evicted anyway (it stays in raw memory and gets folded), then an
 oversized single message is middle-truncated with a recall pointer. The
-token estimate self-calibrates per session from the backend's reported
-`usage.prompt_tokens`.
+token estimate self-calibrates per MODEL from the backend's reported
+`usage.prompt_tokens` (steward calls included). If nothing safe makes it
+fit, the client gets a context-length 400 instead of a silent truncation.
 
 ## 4. Background maintenance (the idle loop, finally)
 
-After the reply is recorded, a per-session task runs under a session lock:
-fold if pressure warrants, then consolidate. The next request for that
-session awaits the lock — a human's typing time usually covers it; a fast
-client simply waits for the fold it would have waited for anyway. If no
-background pass happened (restart, first contact with a long transcript),
-the request path folds synchronously as before. Assistant replies are only
-folded once confirmed by the next request (unchanged).
+After the reply is recorded, one background pass per session runs: fold if
+pressure warrants, then consolidate. It does NOT hold the request lock. The
+next request waits for an in-flight pass up to `MIND_MAINTENANCE_WAIT_S`
+(60 s; a human's typing time usually covers it) and then proceeds on
+committed state — safe because a fold commits atomically and is refused if
+its span went stale (fork) or overlaps an existing fold, and the request
+path never starts a steward while a pass is running. If truth would leave
+view with nothing covering it (restart, first contact with a long
+transcript), the request path folds synchronously. Requests themselves
+serialize per session, taking the lock BEFORE reconciling. Assistant replies
+are only folded once confirmed by the next request (unchanged).
 
 **Consolidation.** Leaf episodes older than the newest 6 are grouped in
 sixes and summarized ONCE into an era line; six eras fold into an epoch.
