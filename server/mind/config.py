@@ -61,6 +61,10 @@ class MindConfig(BaseModel):
     # (every reply ending on a question, recycled closing lines), say so in the
     # notes on the latest user message. See memory_view.style_note.
     style_nudge: bool = os.getenv("MIND_STYLE_NUDGE", "1") == "1"
+    # Quick thoughts (experimental, server/mind/thoughts.py): comma list of
+    # rhythm | observe | typed | sketch | sheet. "rhythm" is the proven
+    # baseline; the rest are designs under A/B.
+    thoughts: str = os.getenv("MIND_THOUGHTS", "rhythm")
     memory_fraction: float = float(os.getenv("MIND_MEMORY_FRACTION", "0.35"))
     memory_min_tokens: int = int(os.getenv("MIND_MEMORY_MIN_TOKENS", "900"))
     memory_max_tokens: int = int(os.getenv("MIND_MEMORY_MAX_TOKENS", "4000"))

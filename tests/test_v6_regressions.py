@@ -745,3 +745,50 @@ def test_style_note_names_the_rut_and_stays_quiet_otherwise():
     assert style_note(rut[:2]) == ""  # too little evidence to call it a habit
     # a statement breaks the streak
     assert "ended with a question" not in style_note(rut + ["That is that."])
+
+
+def test_observe_reads_the_surface_and_stays_quiet_when_nothing_is_off():
+    from server.mind.thoughts import observe
+
+    long_reply = "That sounds like a lot to carry. " + "word " * 95
+    users = ["I had a long day and the dog ate my shoe and then work exploded " * 3, "ok", "lol", "fair", "k thanks"]
+    lines = observe(users, [long_reply] * 5)
+    joined = " ".join(lines)
+    assert "one short line" in joined and "one or two sentences" in joined
+    assert "opening by validating" in joined
+    # Bold text in a chat gets called out, unless the user writes that way too.
+    assert any("plain sentences" in line for line in observe(users, ["**Plan:** do it. " + "w " * 70] * 4))
+    # A varied, plain conversation produces nothing to say.
+    varied = ["Ha. No.", "Honestly I'd sell it. " + "word " * 30, "Sure.", "Tuesday works, bring the dog. " + "w " * 12]
+    assert observe(["so what do you think about the boat then, given everything"] * 4, varied) == []
+
+
+def test_quick_thoughts_join_the_notes_block_and_fail_open(tmp_path):
+    from server.mind.config import MindConfig
+    from server.mind.runtime import MindRuntime
+
+    class Provider:
+        name = "fake"
+        calls = 0
+
+        async def chat_completions(self, payload):
+            Provider.calls += 1
+            assert payload["messages"][-1]["role"] == "user"  # asked over the same prefix
+            if payload.get("max_tokens") == 1:
+                import math
+                return {"choices": [{"message": {"content": "A"}, "logprobs": {"content": [{"token": "A", "top_logprobs": [
+                    {"token": "A", "logprob": math.log(0.9)}, {"token": " B", "logprob": math.log(0.1)}]}]}}]}
+            raise RuntimeError("sketch backend down")
+
+    runtime = MindRuntime(MindConfig(enabled=True, db_dir=str(tmp_path), mem_backend="lexical",
+                                     thoughts="observe,typed,sketch"))
+
+    async def go():
+        transcript = [message("user", "ugh. my boss moved the deadline again, i am so done")]
+        prepared = await runtime.prepare(transcript, Provider(), "m")
+        return prepared.messages[-1]["content"]
+
+    last = asyncio.run(go())
+    assert "They want to be heard" in last and "never mention it" in last
+    assert last.endswith("i am so done")  # the user's words still close the message
+    assert Provider.calls == 2  # typed answered; sketch failed open without breaking the turn

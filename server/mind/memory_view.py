@@ -629,7 +629,7 @@ async def render_memory_parts(
     only when the revision changes or it no longer fits with 15% slack.
     `already_nudged` holds commitment ids whose trigger nudge already fired."""
     clock_line = f"Current time: {format_clock(now)}." if now is not None else ""
-    rhythm = style_note(recent_replies or []) if config.style_nudge else ""
+    rhythm = ""  # quick thoughts are added by the runtime (server/mind/thoughts.py)
     if not (state.records or state.episodes or recalled_spans):
         # Fresh session: no memory framing at all, just the time (and, once
         # there are replies to have a rut in, the rhythm line).

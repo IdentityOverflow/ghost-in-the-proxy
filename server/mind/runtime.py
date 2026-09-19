@@ -38,6 +38,7 @@ from .perception import reconcile, resolve_session
 from .recall import RECALL_TOOL, resolve_recall
 from .router import scope_tools
 from .steward import FoldOutcome, run_steward
+from .thoughts import SHEET, ThoughtTrace, think
 from .store import Event, MindStore, content_text
 
 
@@ -71,6 +72,7 @@ class _Scene:
     # Commitments whose trigger nudge THIS scene carries; committed to the
     # session only for the scene that is actually sent.
     nudged: frozenset = frozenset()
+    thoughts: ThoughtTrace | None = None
 
 
 @dataclass
@@ -190,7 +192,7 @@ class MindRuntime:
             tools_scoped = scoped is not tools
         out_tools = list(scoped) if scoped else []
 
-        scene = await self._scene(session_id, events, clock, out_tools, model)
+        scene = await self._scene(session_id, events, clock, out_tools, model, provider)
         folded = False
         if self._must_fold_now(events, scene):
             # Truth is about to leave view with nothing covering it (first
@@ -198,7 +200,7 @@ class MindRuntime:
             # behind): bounded synchronous catch-up, then rebuild.
             upto = self._fold_boundary(events, scene.workspace.desired_from_seq - 1)
             await self._fold(session_id, events, provider, model, upto, clock, "request")
-            scene = await self._scene(session_id, events, clock, out_tools, model)
+            scene = await self._scene(session_id, events, clock, out_tools, model, provider)
             folded = True
 
         self._nudged.setdefault(session_id, set()).update(scene.nudged)
@@ -277,6 +279,15 @@ class MindRuntime:
             episodes=len(state.episodes),
             consolidations=len(self.store.live_consolidations(session_id)),
             autocue=scene.autocued,
+            thoughts=(
+                {
+                    "modes": scene.thoughts.modes, "lines": scene.thoughts.lines,
+                    "calls": scene.thoughts.calls, "seconds": scene.thoughts.seconds,
+                    **scene.thoughts.detail,
+                }
+                if scene.thoughts
+                else None
+            ),
             folded_on_request=folded,
             waited_for_maintenance_s=round(waited, 2),
         )
@@ -300,6 +311,7 @@ class MindRuntime:
         clock: float | None,
         out_tools: list[dict[str, Any]],
         model: str = "",
+        provider: Any = None,
     ) -> _Scene:
         """Everything the model will see, built from current store state."""
         state = replay(self.store.live_folds(session_id))
@@ -342,26 +354,52 @@ class MindRuntime:
             memory_text = await render_memory(
                 self.config, state, consolidations, threads, **render_args
             )
-        workspace = assemble(
-            self.config,
-            self.store.get_client_system(session_id),
-            events,
-            covered_upto=state.covered_upto,
-            memory_text=memory_text,
-            now=clock,
-            tools_tokens=tools_tokens,
-            scale=scale,
-            volatile_text=volatile_text,
-            memory_budget_tokens=render_args["budget_tokens"],
-            fold_boundaries=(
-                [fold["span_to"] for fold in self.store.live_folds(session_id)]
-                if self.config.memory_placement == "split"
-                else None
-            ),
+        modes = [mode.strip() for mode in self.config.thoughts.split(",") if mode.strip()]
+        if not self.config.style_nudge:
+            modes = [mode for mode in modes if mode != "rhythm"]
+        if "sheet" in modes:
+            memory_text = f"{memory_text}\n\n{SHEET}" if memory_text else SHEET
+
+        def build(volatile: str) -> Workspace:
+            return assemble(
+                self.config,
+                self.store.get_client_system(session_id),
+                events,
+                covered_upto=state.covered_upto,
+                memory_text=memory_text,
+                now=clock,
+                tools_tokens=tools_tokens,
+                scale=scale,
+                volatile_text=volatile,
+                memory_budget_tokens=render_args["budget_tokens"],
+                fold_boundaries=boundaries,
+            )
+
+        boundaries = (
+            [fold["span_to"] for fold in self.store.live_folds(session_id)]
+            if self.config.memory_placement == "split"
+            else None
         )
+        trace = None
+        if modes and self.config.memory_placement == "split" and events and events[-1].role == "user":
+            # Quick thoughts: model-backed designs ask their private question
+            # over the SAME assembled prefix the reply will use (cache hit),
+            # then the lines join the per-turn notes.
+            trace = await think(
+                [mode for mode in modes if mode != "sheet"],
+                provider,
+                model,
+                build(volatile_text).messages,
+                [t for e in events if e.role == "user" and (t := content_text(e.message))],
+                [t for e in events if e.role == "assistant" and (t := content_text(e.message))],
+            )
+            if trace.lines:
+                volatile_text = _with_thoughts(volatile_text, trace.lines)
+        workspace = build(volatile_text)
         return _Scene(
             session_id, workspace, state, threads, len(recalled or []),
             nudged=frozenset(nudged_trial - nudged_before),
+            thoughts=trace,
         )
 
     async def _await_maintenance(self, session_id: str) -> float:
@@ -736,6 +774,21 @@ def _last_user_text(events: list[Event]) -> str:
         ),
         "",
     )
+
+
+def _with_thoughts(volatile: str, lines: list[str]) -> str:
+    """Put the quick thoughts LAST in the notes block — nearest the user's
+    words, where a small model attends most."""
+    from .memory_view import NOTES_CLOSE, NOTES_OPEN
+
+    block = (
+        "Before you reply — your own quick read of this moment (act on it, never mention it):\n"
+        + "\n".join(f"- {line}" for line in lines)
+    )
+    if NOTES_CLOSE in volatile:
+        return volatile.replace(NOTES_CLOSE, f"\n{block}\n{NOTES_CLOSE}", 1)
+    head = f"{volatile}\n" if volatile else ""
+    return f"{NOTES_OPEN}\n{head}{block}\n{NOTES_CLOSE}"
 
 
 def _memory_text(workspace: Workspace) -> str:
