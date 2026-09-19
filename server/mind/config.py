@@ -55,6 +55,12 @@ class MindConfig(BaseModel):
     # Fold in the background after the reply (the next request for the same
     # session waits for an in-flight fold). 0 = only fold on the request path.
     background_fold: bool = os.getenv("MIND_BACKGROUND_FOLD", "1") == "1"
+    # How long a request waits for an in-flight background pass before going
+    # ahead without it (the hard guard keeps the request valid; the pass
+    # lands for the next turn). A slow or rate-limited extraction backend
+    # must never hang the conversation. Eval runs set it high: waiting makes
+    # fold timing deterministic.
+    maintenance_wait_s: float = float(os.getenv("MIND_MAINTENANCE_WAIT_S", "60"))
     # Consolidate leaf episodes into era lines once this many are older than
     # the recent tail; this many eras fold into an epoch.
     era_size: int = int(os.getenv("MIND_ERA_SIZE", "6"))

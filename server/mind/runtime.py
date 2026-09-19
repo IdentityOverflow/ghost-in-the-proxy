@@ -63,6 +63,7 @@ class PreparedRequest:
 
 @dataclass
 class _Scene:
+    session_id: str
     workspace: Workspace
     state: LedgerState
     threads: ThreadsView | None
@@ -91,11 +92,15 @@ class MindRuntime:
         # the rewritten tail gets fresh seqs above the watermark, so it is
         # re-observed.
         self._mem_seen: dict[str, int] = {}
-        # One lock per session serializes scene-building with maintenance:
-        # a request waits for an in-flight fold instead of racing it.
+        # One lock per session serializes REQUESTS (reconcile + scene). The
+        # background pass does not hold it: a request waits for an in-flight
+        # pass only up to maintenance_wait_s, then proceeds on committed
+        # state — folds commit atomically and refuse stale or overlapping
+        # spans, so racing a pass is safe; hanging behind one is not.
         self._locks: dict[str, asyncio.Lock] = {}
         self._context: dict[str, _SessionContext] = {}
         self._background: set[asyncio.Task] = set()
+        self._maintaining: dict[str, asyncio.Task] = {}
         # Real tokens per estimated token, learned from usage.prompt_tokens.
         # Keyed by MODEL: it is a property of the tokenizer, not the session.
         self._scale: dict[str, float] = {}
@@ -156,6 +161,7 @@ class MindRuntime:
         waited: float,
     ) -> PreparedRequest:
         session_id = recon.session_id
+        waited += await self._await_maintenance(session_id)
         events = self.store.live_events(session_id)
         seen = self._mem_seen.get(session_id, 0)
         for event in events:
@@ -303,9 +309,26 @@ class MindRuntime:
             tools_tokens=tools_tokens,
             scale=scale,
         )
-        return _Scene(workspace, state, threads, len(recalled or []))
+        return _Scene(session_id, workspace, state, threads, len(recalled or []))
+
+    async def _await_maintenance(self, session_id: str) -> float:
+        task = self._maintaining.get(session_id)
+        if task is None or task.done():
+            return 0.0
+        started = time.monotonic()
+        await asyncio.wait({task}, timeout=self.config.maintenance_wait_s)
+        waited = time.monotonic() - started
+        if not task.done():
+            print(
+                f"[mind] maintenance still running after {waited:.0f}s; proceeding without it",
+                flush=True,
+            )
+        return waited
 
     def _must_fold_now(self, events: list[Event], scene: _Scene) -> bool:
+        running = self._maintaining.get(scene.session_id)
+        if running is not None and not running.done():
+            return False  # a pass is already folding; never run two stewards
         if scene.workspace.evicted_uncovered > 0:
             return True
         if self.config.background_fold:
@@ -319,46 +342,49 @@ class MindRuntime:
         session lock makes the next request wait for it, nothing else does."""
         if not self.config.background_fold or session_id not in self._context:
             return
+        running = self._maintaining.get(session_id)
+        if running is not None and not running.done():
+            return  # one pass per session at a time; the next reply reschedules
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return  # sync caller (unit tests): maintenance runs on the request path
         task = loop.create_task(self._maintain(session_id))
+        self._maintaining[session_id] = task
         self._background.add(task)
         task.add_done_callback(self._background.discard)
 
     async def _maintain(self, session_id: str) -> None:
         context = self._context[session_id]
         try:
-            async with self._lock(session_id):
-                events = self.store.live_events(session_id)
-                state = replay(self.store.live_folds(session_id))
-                workspace = assemble(
-                    self.config,
-                    self.store.get_client_system(session_id),
-                    events,
-                    covered_upto=state.covered_upto,
-                    memory_text=context.memory_text,
-                    now=context.clock,
-                    tools_tokens=context.tools_tokens,
-                    scale=self._scale.get(context.model, DEFAULT_TOKEN_SCALE),
+            events = self.store.live_events(session_id)
+            state = replay(self.store.live_folds(session_id))
+            workspace = assemble(
+                self.config,
+                self.store.get_client_system(session_id),
+                events,
+                covered_upto=state.covered_upto,
+                memory_text=context.memory_text,
+                now=context.clock,
+                tools_tokens=context.tools_tokens,
+                scale=self._scale.get(context.model, DEFAULT_TOKEN_SCALE),
+            )
+            scene = _Scene(session_id, workspace, state, None, 0)
+            if self._uncovered_tokens(events, scene) > self.config.summary_trigger_tokens:
+                upto = self._fold_boundary(events, workspace.desired_from_seq - 1)
+                await self._fold(
+                    session_id, events, context.provider, context.model, upto,
+                    context.clock, "background",
                 )
-                scene = _Scene(workspace, state, None, 0)
-                if self._uncovered_tokens(events, scene) > self.config.summary_trigger_tokens:
-                    upto = self._fold_boundary(events, workspace.desired_from_seq - 1)
-                    await self._fold(
-                        session_id, events, context.provider, context.model, upto,
-                        context.clock, "background",
-                    )
-                started = time.monotonic()
-                level = await consolidate_once(
-                    self.config, self.store, session_id, context.provider, context.model
+            started = time.monotonic()
+            level = await consolidate_once(
+                self.config, self.store, session_id, context.provider, context.model
+            )
+            if level:
+                emit(
+                    "consolidation", session=session_id, level=level,
+                    seconds=round(time.monotonic() - started, 2),
                 )
-                if level:
-                    emit(
-                        "consolidation", session=session_id, level=level,
-                        seconds=round(time.monotonic() - started, 2),
-                    )
         except Exception as error:
             # Maintenance is best-effort by design: the request path catches
             # up synchronously if it ever has to.

@@ -503,7 +503,7 @@ def test_background_folds_after_reply_and_next_request_waits_without_double_fold
         reply = message("assistant", "reply " * 800)
         runtime.observe_reply(sid, reply)
         await asyncio.wait_for(entered.wait(), 2)
-        assert runtime._lock(sid).locked()
+        assert not runtime._maintaining[sid].done()  # the pass runs OFF the request lock
         assert runtime.store.live_folds(sid) == []  # provider is still thinking
 
         async def next_request():

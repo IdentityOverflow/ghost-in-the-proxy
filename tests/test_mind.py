@@ -698,10 +698,14 @@ def test_render_memory_thread_gating():
 def test_store_threads_versioning_and_fork(store):
     sid = store.create_session(None)
     store.append_event(sid, user("q1"), source="client")
+    store.append_event(sid, user("q2"), source="client")
     store.append_fold(sid, 1, 1, [
         {"op": "thread", "name": "alpha", "summary": "one"},
     ], "")
-    store.append_fold(sid, 1, 1, [
+    # A second fold over the SAME span is refused (two stewards must never
+    # both commit the same events); the next span is fine.
+    assert store.append_fold(sid, 1, 1, [], "dup") is None
+    store.append_fold(sid, 2, 2, [
         {"op": "thread", "id": "t1", "summary": "updated"},
         {"op": "thread", "name": "beta", "summary": "two"},
     ], "")

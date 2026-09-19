@@ -380,6 +380,14 @@ class MindStore:
             ).fetchone()[0]
             if live < len({span_from, span_to}):
                 return None
+            covered = self._conn.execute(
+                "SELECT COALESCE(MAX(span_to), 0) FROM folds WHERE session = ? AND superseded = 0",
+                (session_id,),
+            ).fetchone()[0]
+            if span_from <= covered:
+                # Another pass already folded (part of) this span — two
+                # stewards must never both commit the same events.
+                return None
             row = self._conn.execute(
                 "SELECT COALESCE(MAX(seq), 0) FROM folds WHERE session = ?", (session_id,)
             ).fetchone()

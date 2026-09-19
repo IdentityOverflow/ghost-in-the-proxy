@@ -431,3 +431,49 @@ def test_user_opening_anchor_excludes_unrelated_session(runtime):
     assert sid in runtime.store.list_session_ids(anchor)
     assert unrelated not in runtime.store.list_session_ids(anchor)
     assert reconcile(runtime.store, transcript + [message("assistant", "hello")]).session_id == sid
+
+
+def test_request_does_not_hang_behind_stuck_maintenance(tmp_path, monkeypatch):
+    # Live: a background fold stuck in upstream 429 retries held the session
+    # lock and the next request waited >300 s (harness timeout, soak aborted).
+    # A request now waits at most maintenance_wait_s, proceeds on committed
+    # state, and never starts a second steward for the same span.
+    from server.mind.runtime import MindRuntime
+    from server.mind.config import MindConfig
+
+    cfg = MindConfig(
+        enabled=True, db_dir=str(tmp_path), mem_backend="lexical", window=8192,
+        workspace_cap_tokens=2400, summary_trigger_tokens=10, min_keep_turns=1,
+        maintenance_wait_s=0.05,
+    )
+    runtime = MindRuntime(cfg)
+    calls = []
+
+    async def go():
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def stuck(*args, **kwargs):
+            calls.append(args[6])
+            entered.set()
+            await release.wait()
+            from server.mind.steward import FoldOutcome
+            return FoldOutcome()
+
+        monkeypatch.setattr("server.mind.runtime.run_steward", stuck)
+        transcript = [message("user", "first " * 330), message("assistant", "answer " * 510),
+                      message("user", "second " * 220)]
+        prepared = await runtime.prepare(transcript, None, "m")
+        sid = prepared.session_id
+        reply = message("assistant", "reply " * 800)
+        runtime.observe_reply(sid, reply)
+        await asyncio.wait_for(entered.wait(), 2)
+        following = await asyncio.wait_for(
+            runtime.prepare(transcript + [reply, message("user", "next")], None, "m"), 2
+        )
+        assert following.session_id == sid
+        assert following.messages[-1]["content"] == "next"
+        assert len(calls) == 1  # the request did not start a rival steward
+        release.set()
+        await runtime.drain()
+
+    asyncio.run(go())
