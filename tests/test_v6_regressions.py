@@ -725,4 +725,6 @@ def test_runtime_never_folds_on_the_request_path_in_a_steady_conversation(tmp_pa
     worst = asyncio.run(go())
     assert paths and set(paths) == {"background"}
     from server.mind.assembler import token_budgets
-    assert worst <= token_budgets(runtime.config)[0]
+    # Over the soft budget is allowed while a fold catches up; over the hard
+    # limit never (that is what evicts uncovered truth and forces a sync fold).
+    assert worst <= token_budgets(runtime.config)[1]

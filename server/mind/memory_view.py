@@ -530,10 +530,13 @@ def _fill(
 
 
 def _stable_commitment_line(record: Record) -> str:
+    # Plain sentences, not labelled fields: a 12B model asked for a recap
+    # copied "(Triggered whenever we talk about ...)" straight into its reply.
     data = record.data
-    line = f"- ({data.get('actor', 'assistant')}) {data.get('statement')}"
+    owner = "the user's own to-do: " if data.get("actor") == "user" else ""
+    line = f"- {owner}{data.get('statement')}"
     if data.get("trigger"):
-        line += f" — trigger: {data['trigger']}"
+        line += f" — to come up when {data['trigger']}"
     due = parse_due(data.get("due"))
     if due is not None:
         line += f" — due {format_clock(due)}"  # absolute: relative urgency is volatile
