@@ -94,6 +94,18 @@ on a laptop only if phase A makes the two-call turn cheaper than today's
 one. Never for routine chat, exact transformations, tool continuations, or
 tasks that need real reasoning.
 
+**First customer: the steward itself.** Measured on the owner's laptop
+(LM Studio, gemma-4-12b — which, despite the "reasoning disabled" UI setting,
+spends ~2400 reasoning tokens per API call): the same fold span extracted 4
+facts in 233 s unconstrained, and 1 fact in 20 s under the strict JSON schema
+(the grammar suppresses the think block — and with it, recall). A `"noticed"`
+list as the FIRST schema property ("every durable thing the user said, a few
+words each", then one op per item) is exactly a quick thought. First attempt
+timed out at 300 s locally: with thinking suppressed the model pours its
+chain of thought into the first free-text field, so the strings need hard
+length bounds (and the grammar cost of `maxLength`/`maxItems` on llama.cpp
+needs measuring). Worth doing before anything user-facing.
+
 ## Order
 
 A → B → C. A makes iteration (and the laptop) affordable; B establishes
