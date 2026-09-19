@@ -140,9 +140,63 @@ Each piece of text is therefore rewritten O(log n) times over the life of
 the conversation, not once per fold, and the leaves are never deleted —
 eras are a disposable index over them, regenerated after a fork.
 
-## 5. Not in this phase
+## 5. Results — the s14 soak (2026-09-19)
 
-- Cross-conversation identity (one persistent agent across chats, keyed by
-  model alias) — the next step toward "persistent agent with personality".
-- A mind-owned self-model (the agent's own stances, running jokes, voice).
-- Quick thoughts (fast Q/A micro-reasoning) — after memory is proven.
+160 turns, 20 weekly sessions on the virtual clock, 24 single-shot probes
+(near/mid/far x early/late; facts, corrections, decision status, commitment
+triggers, mundane asides). `google/gemma-4-26b-a4b-it` via OpenRouter,
+reasoning off, bge-m3 embeddings, same script and rubrics for every arm
+(stored replies regraded after rubric fixes — see evals/regrade.py).
+
+| arm | window | reached | probes | how it ended |
+|---|---|---|---|---|
+| v5 (as committed on main) | 8k | turn 127 | 13/13 | a fold on the request path outlived the client's 300 s timeout |
+| v5 | 4k | turn 118 | 10/10 | **hit the context wall** (4232 > 4096): memory section had outgrown the whole budget |
+| v6 | 8k | **160** | **24/24** | completed |
+| v6 | 4k | **160** | **23/24** | completed; the miss was an honest "I don't have that", not a confabulation |
+
+v5 never answered a probe wrong — with a strong steward the telephone game
+is slow. It simply does not survive: its memory section grew ~20 tokens a
+turn without bound (626 -> 2227 tokens over 100 turns at 8k; 2421 tokens by
+turn 72 at 4k, against a 2304-token workspace), verbatim texture shrank to
+its floor, and the conversation ended. On the owner's laptop it ended sooner:
+the first v5 fold exceeded the provider's 120 s timeout at turn 21.
+
+v6 trajectory, means per 20-turn bucket (8k / 4k):
+
+| turns | memory tokens | texture messages | ledger records | prompt tokens |
+|---|---|---|---|---|
+| 21-40 | 695 / 918 | 38 / 14 | 8 / 15 | 5723 / 2810 |
+| 61-80 | 1828 / 919 | 32 / 14 | 29 / 37 | 5803 / 2796 |
+| 101-120 | 2039 / 939 | 31 / 15 | 56 / 61 | 5930 / 2844 |
+| 141-160 | 1953 / 924 | 33 / 17 | 70 / 84 | 5631 / 2808 |
+
+The ledger grows for as long as the conversation lives; what the model sees
+of it does not. 23 folds at 8k, none degraded, mean 11 s, one on the request
+path; 304 ops applied, 6 dropped, 7 merged as restatements.
+
+**What the soak taught on the way** (each was a failed probe first, then a
+cause, then a fix with a regression test): a correction arriving as
+`update(id, claim=...)` against a DECISION was silently dropped (value fields
+are now aliases across kinds); a budget first recorded as a decision was
+later "corrected" by adding a contradicting fact (restatements now merge
+across fact/decision kinds); a loose all-optional JSON schema let constrained
+decoding wander (`add` with no kind, the fact in `trigger`) — now a strict
+discriminated union, and ~15% prose fallbacks became 0; auto-cue fired on
+133/160 turns off a fixed cosine floor and ranked long assistant replies
+above one-line user asides; a multi-part question embedded as a blur that
+matched none of its parts; a request waited unboundedly behind a background
+pass stuck in upstream 429s. Two of my own rubrics were wrong as well (one
+false pass, one false fail) and one probe planted a distractor for another.
+
+**Known limit.** A vague cue ("that old keepsake hidden in the bodywork")
+scores 0.44 against the ferry-ticket record on bge-m3 — under any sane
+floor. At 8k the record is usually in view anyway; at 4k it is not, and the
+model says so instead of calling recall (told to, still does not — the s13
+finding again). Closing that gap is query expansion by the model itself,
+which is what phase C of docs/roadmap.md is for.
+
+## 6. Not in this phase
+
+See docs/roadmap.md: the cache contract (prefix-cache-friendly workspace),
+one mind across conversations (agent identity + self-model), quick thoughts.
