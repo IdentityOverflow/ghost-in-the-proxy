@@ -330,6 +330,7 @@ class MindRuntime:
             tools_tokens=tools_tokens,
             scale=scale,
             volatile_text=volatile_text,
+            memory_budget_tokens=render_args["budget_tokens"],
             fold_boundaries=(
                 [fold["span_to"] for fold in self.store.live_folds(session_id)]
                 if self.config.memory_placement == "split"

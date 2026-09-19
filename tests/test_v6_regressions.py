@@ -615,3 +615,40 @@ def test_extraction_target_routes_to_another_provider(tmp_path, monkeypatch):
     assert runtime._extraction_target(local, "gemma-local") == (local, "smaller-local-model")
     runtime.config.extraction_model = None
     assert runtime._extraction_target(local, "gemma-local") == (local, "gemma-local")
+
+
+def test_first_fold_lands_into_reserved_space(tmp_path):
+    # Live: 32 turns of pure texture filled the whole workspace; when the first
+    # fold landed, the new ~1.3k-token memory section overflowed the hard
+    # limit, uncovered events were evicted and a second fold ran ON the
+    # request path (a 169 s turn). Pressure is now measured with the memory
+    # budget reserved from turn one, so a fold never forces another.
+    from server.mind.assembler import assemble, token_budgets
+    from server.mind.config import MindConfig
+    from server.mind.memory_view import memory_budget
+    from server.mind.store import MindStore
+
+    cfg = MindConfig(window=8192)
+    store = MindStore(tmp_path / "m.sqlite3")
+    sid = store.create_session(None)
+    for turn in range(40):
+        store.append_event(sid, message("user", f"turn {turn} " + "word " * 120), source="client")
+        store.append_event(sid, message("assistant", f"reply {turn} " + "word " * 120), source="mind")
+    events = store.live_events(sid)
+    budget, hard = token_budgets(cfg)
+    reserve = memory_budget(cfg, budget)
+
+    empty = assemble(cfg, "sys", events, covered_upto=0, memory_budget_tokens=reserve)
+    # What the budget WANTS in view leaves room for a full memory section...
+    wanted = sum(
+        len(json.dumps(e.message)) // 4 for e in events if e.seq >= empty.desired_from_seq
+    )
+    assert wanted + reserve <= budget
+    # ...so once a fold covers the rest and memory appears, nothing uncovered is evicted.
+    landed = assemble(
+        cfg, "sys", events, covered_upto=empty.desired_from_seq - 1,
+        memory_text="m" * (reserve * 4 * 6 // 10), volatile_text="v" * (reserve * 4 * 4 // 10),
+        memory_budget_tokens=reserve, fold_boundaries=[empty.desired_from_seq - 1],
+    )
+    assert landed.evicted_uncovered == 0
+    assert landed.estimated_tokens <= hard

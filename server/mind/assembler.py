@@ -115,6 +115,7 @@ def assemble(
     scale: float = DEFAULT_TOKEN_SCALE,
     volatile_text: str = "",
     fold_boundaries: list[int] | None = None,
+    memory_budget_tokens: int = 0,
 ) -> Workspace:
     """`memory_text` rides in the system message; `volatile_text` (per-turn
     memory, phase A) is prefixed to the latest user message so everything
@@ -130,7 +131,16 @@ def assemble(
     system_content = "\n\n".join(system_parts)
     system_cost = estimate_tokens(system_content) if system_content else 0
 
-    texture_budget = workspace_budget - system_cost
+    # Texture never gets the memory section's share, even while memory is
+    # still empty. Otherwise the first fold triggers only when texture alone
+    # fills the workspace, and the moment it lands the new memory section
+    # (0 -> ~1.3k tokens) overflows the hard limit: uncovered events are
+    # evicted and a SECOND fold runs synchronously (live: a 169 s turn).
+    memory_now = (estimate_tokens(memory_text) if memory_text else 0) + (
+        estimate_tokens(volatile_text) if volatile_text else 0
+    )
+    unused_memory = max(0, memory_budget_tokens - memory_now)
+    texture_budget = workspace_budget - system_cost - unused_memory
 
     # Containment (v3): under budget pressure, stale tool payloads render as
     # digests — the full text stays in the event store, reachable via recall.
@@ -147,7 +157,7 @@ def assemble(
     if digested and system_content:
         system_content += "\n\n" + DIGEST_NOTICE
         system_cost = estimate_tokens(system_content)
-        texture_budget = workspace_budget - system_cost
+        texture_budget = workspace_budget - system_cost - unused_memory
 
     # Chronos (v4): real elapsed time between turns renders as an inline
     # marker on the later user message — no role changes, so chat-template
@@ -205,7 +215,7 @@ def assemble(
             candidate = blocks[index:]
             if not candidate:
                 continue
-            fits = system_cost + sum(block_cost(block) for block in candidate) <= workspace_budget
+            fits = system_cost + unused_memory + sum(block_cost(block) for block in candidate) <= workspace_budget
             if fits or boundary == starts[-1]:
                 # Every boundary is <= covered_upto, so no uncovered event is
                 # ever dropped here; the last one may run over budget, exactly
