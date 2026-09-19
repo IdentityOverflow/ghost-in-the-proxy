@@ -25,6 +25,7 @@ Designs, switchable and combinable via MIND_THOUGHTS (comma list):
            the confidence; only a confident read becomes a line.
   sketch   D2 — one short generation: three different moves, then a pick; the
            picked path is the line ("pick a path, expand live").
+  sketchlite  the same with two moves of <= 6 words (about a third of the cost)
   sheet    D1 — a static "how to talk like a person" sheet in the system
            message (expected to do little; cheap to test).
 """
@@ -219,12 +220,26 @@ SKETCH_QUESTION = (
 )
 
 
-async def sketch_path(provider: Any, model: str, messages: list[dict[str, Any]], trace: ThoughtTrace) -> str | None:
+SKETCH_LITE_QUESTION = (
+    "[Private check — not part of the conversation.]\n"
+    "Two DIFFERENT ways a good friend might respond to that, at most 6 words each, then pick.\n"
+    "Format exactly:\n1. ...\n2. ...\nPICK: <number>"
+)
+
+
+async def sketch_lite(provider: Any, model: str, messages: list[dict[str, Any]], trace: ThoughtTrace) -> str | None:
+    return await sketch_path(provider, model, messages, trace, question=SKETCH_LITE_QUESTION, max_tokens=34)
+
+
+async def sketch_path(
+    provider: Any, model: str, messages: list[dict[str, Any]], trace: ThoughtTrace,
+    question: str = SKETCH_QUESTION, max_tokens: int = 70,
+) -> str | None:
     payload = {
         "model": model,
-        "messages": _question_messages(messages, SKETCH_QUESTION),
+        "messages": _question_messages(messages, question),
         "temperature": 0.8,
-        "max_tokens": 70,
+        "max_tokens": max_tokens,
         "stream": False,
     }
     response = await provider.chat_completions(payload)
@@ -252,7 +267,7 @@ async def think(
     trace = ThoughtTrace(modes=list(modes))
     started = time.monotonic()
     lines: list[str] = []
-    for mode, call in (("typed", typed_read), ("sketch", sketch_path)):
+    for mode, call in (("typed", typed_read), ("sketch", sketch_path), ("sketchlite", sketch_lite)):
         if mode in modes and user_turns and provider is not None:
             try:
                 line = await call(provider, model, messages, trace)

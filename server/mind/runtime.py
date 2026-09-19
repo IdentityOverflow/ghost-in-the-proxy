@@ -192,7 +192,7 @@ class MindRuntime:
             tools_scoped = scoped is not tools
         out_tools = list(scoped) if scoped else []
 
-        scene = await self._scene(session_id, events, clock, out_tools, model, provider)
+        scene = await self._scene(session_id, events, clock, out_tools, model, provider, bool(tools))
         folded = False
         if self._must_fold_now(events, scene):
             # Truth is about to leave view with nothing covering it (first
@@ -200,7 +200,7 @@ class MindRuntime:
             # behind): bounded synchronous catch-up, then rebuild.
             upto = self._fold_boundary(events, scene.workspace.desired_from_seq - 1)
             await self._fold(session_id, events, provider, model, upto, clock, "request")
-            scene = await self._scene(session_id, events, clock, out_tools, model, provider)
+            scene = await self._scene(session_id, events, clock, out_tools, model, provider, bool(tools))
             folded = True
 
         self._nudged.setdefault(session_id, set()).update(scene.nudged)
@@ -312,6 +312,7 @@ class MindRuntime:
         out_tools: list[dict[str, Any]],
         model: str = "",
         provider: Any = None,
+        client_has_tools: bool = False,
     ) -> _Scene:
         """Everything the model will see, built from current store state."""
         state = replay(self.store.live_folds(session_id))
@@ -357,6 +358,11 @@ class MindRuntime:
         modes = [mode.strip() for mode in self.config.thoughts.split(",") if mode.strip()]
         if not self.config.style_nudge:
             modes = [mode for mode in modes if mode != "rhythm"]
+        if client_has_tools:
+            # A client that sends a tool belt is an agent harness (a coding
+            # assistant, an MCP client), not a chat between friends: "say
+            # less, no lists, tease a little" would be sabotage there.
+            modes = []
         if "sheet" in modes:
             memory_text = f"{memory_text}\n\n{SHEET}" if memory_text else SHEET
 

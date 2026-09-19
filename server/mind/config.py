@@ -62,9 +62,11 @@ class MindConfig(BaseModel):
     # notes on the latest user message. See memory_view.style_note.
     style_nudge: bool = os.getenv("MIND_STYLE_NUDGE", "1") == "1"
     # Quick thoughts (experimental, server/mind/thoughts.py): comma list of
-    # rhythm | observe | typed | sketch | sheet. "rhythm" is the proven
-    # baseline; the rest are designs under A/B.
-    thoughts: str = os.getenv("MIND_THOUGHTS", "rhythm")
+    # rhythm | observe | sheet | typed | sketch | sketchlite. Default is the
+    # free combination that won the A/B (docs/quick-thoughts.md): blind
+    # preference 15-5 and 18-1 over the rhythm-only baseline on two scripts,
+    # zero model calls. Add "sketch" for the best-sounding setup at ~+5 s.
+    thoughts: str = os.getenv("MIND_THOUGHTS", "sheet,observe")
     memory_fraction: float = float(os.getenv("MIND_MEMORY_FRACTION", "0.35"))
     memory_min_tokens: int = int(os.getenv("MIND_MEMORY_MIN_TOKENS", "900"))
     memory_max_tokens: int = int(os.getenv("MIND_MEMORY_MAX_TOKENS", "4000"))

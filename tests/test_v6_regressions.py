@@ -792,3 +792,22 @@ def test_quick_thoughts_join_the_notes_block_and_fail_open(tmp_path):
     assert "They want to be heard" in last and "never mention it" in last
     assert last.endswith("i am so done")  # the user's words still close the message
     assert Provider.calls == 2  # typed answered; sketch failed open without breaking the turn
+
+
+def test_quick_thoughts_stay_out_of_tool_using_clients(tmp_path):
+    from server.mind.config import MindConfig
+    from server.mind.runtime import MindRuntime
+
+    runtime = MindRuntime(MindConfig(enabled=True, db_dir=str(tmp_path), mem_backend="lexical",
+                                     thoughts="sheet,observe"))
+    tool = {"type": "function", "function": {"name": "read_file", "description": "x", "parameters": {"type": "object", "properties": {}}}}
+
+    async def go(tools):
+        prepared = await runtime.prepare(
+            [message("system", "You are a coding agent."), message("user", f"fix the bug please {tools is None}")],
+            None, "m", tools=tools,
+        )
+        return prepared.messages[0]["content"]
+
+    assert "How to talk" in asyncio.run(go(None))
+    assert "How to talk" not in asyncio.run(go([tool, tool, tool]))

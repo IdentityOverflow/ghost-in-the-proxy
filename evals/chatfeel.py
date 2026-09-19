@@ -189,8 +189,12 @@ def judge(first: str, second: str, pairs: int, seed: int, skip: int) -> None:
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=900,
         )
         match = re.search(r"\[.*\]", result.stdout, flags=re.DOTALL)
-        if match:
-            break
+        try:
+            if match and len(json.loads(match.group(0))) == len(chosen):
+                break
+        except ValueError:
+            pass
+        match = None
     if not match:
         print("judge returned no JSON:", result.stdout[:400], result.stderr[:400])
         return

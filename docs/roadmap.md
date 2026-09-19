@@ -64,7 +64,7 @@ values are preserved, never last-writer-wins. Explicit session ids become
 necessary (two chats both opening with "hello" are indistinguishable by
 prefix).
 
-## C — Quick thoughts
+## C — Quick thoughts — FIRST ROUND DONE, see docs/quick-thoughts.md
 
 **The idea (Paul).** Humans do not run long chain-of-thought in conversation.
 They have short fast thoughts — brief contextual questions with blunt, even
