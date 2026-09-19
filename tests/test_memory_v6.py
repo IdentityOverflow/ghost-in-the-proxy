@@ -222,13 +222,14 @@ def test_empty_steward_proposal_preserves_ledger_and_commits_prose(store, empty)
     sid = session_with_events(store, 4)
     store.append_fold(sid, 1, 2, [fact(), commitment()], "before")
     before = replay(store.live_folds(sid))
-    provider = CannedProvider(empty, "<think>private reasoning</think>They discussed travel.")
+    # proposal, one unconstrained retry, then the episode-only fallback
+    provider = CannedProvider(empty, empty, "<think>private reasoning</think>They discussed travel.")
     outcome = asyncio.run(steward.run_steward(
         config(), store, sid, store.live_events(sid), provider, "m", 4,
     ))
     folds = store.live_folds(sid)
     assert outcome.folds == outcome.prose_fallbacks == 1
-    assert len(provider.calls) == 2
+    assert len(provider.calls) == 3
     assert folds[-1]["kind"] == "prose" and folds[-1]["ops"] == []
     assert folds[-1]["episode"] == "They discussed travel."
     after = replay(folds)
@@ -585,3 +586,32 @@ def test_delta_collector_usage_only_chunk_with_empty_choices():
     collector.feed(usage[37:] + b'data: [DONE]\n\n')
     assert collector.prompt_tokens == 1234
     assert collector.message() == {"role": "assistant", "content": "hello"}
+
+
+def test_steward_salvages_complete_ops_from_truncated_json(store):
+    # Live failure shape (gemma-4-26b, schema-constrained): derails mid-object
+    # with a mangled key and whitespace to the token cap. The complete ops
+    # before the break must still commit, as a normal steward fold.
+    sid = session_with_events(store, 2)
+    broken = (
+        '{"ops":[{"op":"add","kind":"fact","subject":"van {name}","claim":"Juniper \\"the van\\""},'
+        '{"op":"thread","id":"n2","name":"safety","kind:":"topic","summary_":"Mara is researching\n\n\n   \n\n'
+    )
+    provider = CannedProvider(broken)
+    outcome = asyncio.run(steward.run_steward(
+        config(), store, sid, store.live_events(sid), provider, "m", 2,
+    ))
+    assert outcome.folds == 1 and outcome.prose_fallbacks == 0
+    assert len(provider.calls) == 1
+    state = replay(store.live_folds(sid))
+    assert [r.data["claim"] for r in state.records.values()] == ['Juniper "the van"']
+
+
+def test_steward_mangled_keys_are_normalized(store):
+    sid = session_with_events(store, 2)
+    proposal = '{"ops":[{"op":"thread","id":"n1","name":"heating","kind:":"aside","summary ":"Heater talk."}],"episode":"x"}'
+    asyncio.run(steward.run_steward(
+        config(), store, sid, store.live_events(sid), CannedProvider(proposal), "m", 2,
+    ))
+    thread = next(iter(replay(store.live_folds(sid)).threads.values()))
+    assert thread.data["kind"] == "aside" and thread.data["summary"] == "Heater talk."

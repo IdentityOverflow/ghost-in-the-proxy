@@ -317,10 +317,21 @@ async def _fold_pass(
     episode = ""
     kind = "steward"
     try:
-        content = await _extract(
-            config, provider, extraction_model, messages, schema=True, scale=scale, on_usage=on_usage
-        )
-        ops, episode = _parse_proposal(content)
+        try:
+            content = await _extract(
+                config, provider, extraction_model, messages, schema=True, scale=scale, on_usage=on_usage
+            )
+            ops, episode = _parse_proposal(content)
+        except StewardParseError as error:
+            # Observed live (gemma-4-26b via OpenRouter, schema-constrained):
+            # ~15% of proposals derail mid-object ('"kind:"', then whitespace
+            # to the token cap). An episode-only fold would lose the span's
+            # facts for good, so try once more unconstrained first.
+            outcome.errors.append(f"retry after {error!r}"[:200])
+            content = await _extract(
+                config, provider, extraction_model, messages, schema=False, scale=scale
+            )
+            ops, episode = _parse_proposal(content)
     except Exception as error:
         outcome.errors.append(repr(error)[:300])
         print(f"[mind] steward proposal unusable ({error!r}); episode-only fold", flush=True)
@@ -471,26 +482,84 @@ def _parse_proposal(content: str) -> tuple[list[dict[str, Any]], str]:
     # would garbage the greedy JSON match; deliberation is not the proposal.
     content = _strip_think(content)
     match = re.search(r"\{.*\}", content, flags=re.DOTALL)
-    if not match:
-        raise StewardParseError(f"no JSON object in steward output: {content[:150]!r}")
-    try:
-        data = json.loads(match.group(0))
-    except json.JSONDecodeError as error:
-        raise StewardParseError(f"steward JSON invalid: {error}") from error
-    if not isinstance(data, dict):
-        raise StewardParseError("steward output is not an object")
-    ops = data.get("ops", [])
-    if not isinstance(ops, list):
-        raise StewardParseError("steward field ops is not a list")
-    episode = data.get("episode") or ""
-    if isinstance(episode, dict):
-        episode = episode.get("text") or ""
-    episode = str(episode).strip()
-    ops = [op for op in ops if isinstance(op, dict)]
+    data: Any = None
+    if match:
+        try:
+            data = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            data = None
+    if data is None:
+        # Truncated or locally malformed: salvage every op object that IS
+        # complete rather than discard the whole proposal.
+        ops, episode = _salvage(content)
+        if not ops and not episode:
+            raise StewardParseError(f"no usable JSON in steward output: {content[:150]!r}")
+    else:
+        if not isinstance(data, dict):
+            raise StewardParseError("steward output is not an object")
+        ops = data.get("ops", [])
+        if not isinstance(ops, list):
+            raise StewardParseError("steward field ops is not a list")
+        episode = data.get("episode") or ""
+        if isinstance(episode, dict):
+            episode = episode.get("text") or ""
+        episode = str(episode).strip()
+    ops = [_clean_keys(op) for op in ops if isinstance(op, dict)]
     if not ops and not episode:
         # `{}` parses fine and says nothing: that is a failed extraction,
         # not an instruction (under v1 it erased the whole ledger).
         raise StewardParseError("steward proposal is empty")
+    return ops, episode
+
+
+def _clean_keys(op: dict[str, Any]) -> dict[str, Any]:
+    """'kind:' / 'summary_' / 'summary ' -> the key the model meant."""
+    return {re.sub(r"[\s:_]+$", "", str(key)).strip(): value for key, value in op.items()}
+
+
+def _salvage(content: str) -> tuple[list[dict[str, Any]], str]:
+    """Pull complete {...} objects out of a broken "ops" array, and the
+    episode string if it survived. String-aware brace matching; anything
+    that does not parse on its own is skipped."""
+    ops: list[dict[str, Any]] = []
+    start = content.find("[", max(content.find('"ops"'), 0))
+    if start != -1:
+        depth, in_string, escaped, begin = 0, False, False, -1
+        for position in range(start + 1, len(content)):
+            char = content[position]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                if depth == 0:
+                    begin = position
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0 and begin != -1:
+                    try:
+                        parsed = json.loads(content[begin : position + 1])
+                        if isinstance(parsed, dict):
+                            ops.append(parsed)
+                    except json.JSONDecodeError:
+                        pass
+                    begin = -1
+            elif char == "]" and depth == 0:
+                break
+    episode = ""
+    found = re.search(r'"episode"\s*:\s*"((?:[^"\\]|\\.)*)"', content, flags=re.DOTALL)
+    if found:
+        try:
+            episode = json.loads(f'"{found.group(1)}"').strip()
+        except json.JSONDecodeError:
+            episode = found.group(1).strip()
     return ops, episode
 
 
