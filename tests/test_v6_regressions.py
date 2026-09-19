@@ -774,7 +774,7 @@ def test_quick_thoughts_join_the_notes_block_and_fail_open(tmp_path):
         async def chat_completions(self, payload):
             Provider.calls += 1
             assert payload["messages"][-1]["role"] == "user"  # asked over the same prefix
-            if payload.get("max_tokens") == 1:
+            if payload.get("logprobs"):
                 import math
                 return {"choices": [{"message": {"content": "A"}, "logprobs": {"content": [{"token": "A", "top_logprobs": [
                     {"token": "A", "logprob": math.log(0.9)}, {"token": " B", "logprob": math.log(0.1)}]}]}}]}

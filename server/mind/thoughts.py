@@ -58,6 +58,13 @@ VALIDATION_OPENERS = re.compile(
     r"congratulations|congrats|ah,? the)\b",
     flags=re.IGNORECASE,
 )
+# What a blind judge kept citing against the baseline: "forced praise",
+# "inflates", "canned reassurance".
+HYPE = re.compile(
+    r"\b(huge|massive|amazing|incredible|fantastic|wonderful|awesome|absolutely|victory|milestone|"
+    r"so proud|you've earned|you deserve|well[- ]deserved|a (big|major|real) win)\b",
+    flags=re.IGNORECASE,
+)
 MARKDOWN = re.compile(r"\*\*[^*]+\*\*|^\s*([-*•]|\d+\.)\s+\S|^#{1,4}\s", flags=re.MULTILINE)
 QUOTED = re.compile(r"[\"“']([^\"”']{6,60})[\"”']")
 
@@ -95,6 +102,11 @@ def observe(user_turns: list[str], replies: list[str]) -> list[str]:
         lines.append(
             "You keep opening by validating or summarising what they said. Start with your own "
             "reaction, an opinion, or the answer."
+        )
+    if sum(len(HYPE.findall(reply)) >= 2 for reply in window) >= 2:
+        lines.append(
+            "You have been cheerleading (\"huge\", \"massive win\", \"you've earned it\"). React at the "
+            "size the thing actually is; skip the praise."
         )
     if sum(bool(MARKDOWN.search(reply)) for reply in window) >= 2 and not MARKDOWN.search(latest):
         lines.append("You have been using bold text or lists. This is a chat — plain sentences only.")
@@ -163,7 +175,9 @@ async def typed_read(provider: Any, model: str, messages: list[dict[str, Any]], 
         "model": model,
         "messages": _question_messages(messages, REGISTER_QUESTION),
         "temperature": 0,
-        "max_tokens": 1,
+        # Not 1: gemma under LM Studio spends its first token on a stripped
+        # channel marker and returns nothing at all (live: 0 reads in 26 turns).
+        "max_tokens": 6,
         "logprobs": True,
         "top_logprobs": 10,
         "stream": False,
@@ -172,8 +186,10 @@ async def typed_read(provider: Any, model: str, messages: list[dict[str, Any]], 
     trace.calls += 1
     choice = response["choices"][0]
     probabilities: dict[str, float] = {}
-    tokens = ((choice.get("logprobs") or {}).get("content") or [])[:1]
-    for token in tokens:
+    tokens = (choice.get("logprobs") or {}).get("content") or []
+    # The answer is the first emitted token that IS one of the letters.
+    answer = next((t for t in tokens if str(t.get("token", "")).strip().upper()[:1] in REGISTER_LINES), None)
+    for token in [answer] if answer else []:
         for candidate in token.get("top_logprobs") or []:
             letter = str(candidate.get("token", "")).strip().upper()[:1]
             if letter in REGISTER_LINES:

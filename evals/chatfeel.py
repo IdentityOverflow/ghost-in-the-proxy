@@ -40,6 +40,11 @@ VALIDATION_OPENERS = re.compile(
     r"congratulations|congrats|ah,? the)\b",
     flags=re.IGNORECASE,
 )
+HYPE = re.compile(
+    r"\b(huge|massive|amazing|incredible|fantastic|wonderful|awesome|absolutely|victory|milestone|"
+    r"so proud|you've earned|you deserve|well[- ]deserved|a (big|major|real) win)\b",
+    flags=re.IGNORECASE,
+)
 MARKDOWN = re.compile(r"\*\*[^*]+\*\*|^\s*([-*•]|\d+\.)\s+\S|^#{1,4}\s", flags=re.MULTILINE)
 QUOTED = re.compile(r"[\"“']([^\"”']{6,60})[\"”']")
 
@@ -90,6 +95,7 @@ def tells(session: str, limit: int | None = None) -> dict:
         "ends_on_question": sum(ends_q) / len(pairs),
         "validation_opener": sum(bool(VALIDATION_OPENERS.match(r.strip())) for r in replies) / len(pairs),
         "markdown": sum(bool(MARKDOWN.search(r)) for r in replies) / len(pairs),
+        "cheerleading": sum(len(HYPE.findall(r)) for r in replies) / len(pairs),
         "quotes_user_back": echo / len(pairs),
         "mean_words": statistics.mean(lengths),
         "length_variation": statistics.pstdev(lengths) / max(1.0, statistics.mean(lengths)),
@@ -109,6 +115,7 @@ def print_tells(sessions: list[str], limit: int | None) -> None:
         ("ends_on_question", "replies ending on a question", "{:.0%}"),
         ("validation_opener", "validation / summary openers", "{:.0%}"),
         ("markdown", "bold / lists in chat", "{:.0%}"),
+        ("cheerleading", "hype words per reply", "{:.1f}"),
         ("quotes_user_back", "quotes the user back", "{:.0%}"),
         ("mean_words", "mean reply length (words)", "{:.0f}"),
         ("words_after_short_user_turn", "  …after a <=12-word user turn", "{:.0f}"),
@@ -175,11 +182,15 @@ def judge(first: str, second: str, pairs: int, seed: int, skip: int) -> None:
             f"--- Moment {number}\nPERSON: {a_turns[index][0]}\n\nREPLY A: {reply_a}\n\nREPLY B: {reply_b}\n"
         )
     prompt = JUDGE_PROMPT.format(n=len(moments), moments="\n".join(moments))
-    result = subprocess.run(
-        ["pi", "-p", "--no-session", "--model", "openai-codex/gpt-6-astra", "--thinking", "low", "-nt", prompt],
-        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=900,
-    )
-    match = re.search(r"\[.*\]", result.stdout, flags=re.DOTALL)
+    match = None
+    for _attempt in range(3):  # the CLI occasionally returns nothing; ask again
+        result = subprocess.run(
+            ["pi", "-p", "--no-session", "--model", "openai-codex/gpt-6-astra", "--thinking", "low", "-nt", prompt],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=900,
+        )
+        match = re.search(r"\[.*\]", result.stdout, flags=re.DOTALL)
+        if match:
+            break
     if not match:
         print("judge returned no JSON:", result.stdout[:400], result.stderr[:400])
         return
