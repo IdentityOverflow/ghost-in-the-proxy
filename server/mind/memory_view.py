@@ -14,6 +14,7 @@ channel. A partial list always says it is partial — the v1 header called
 the commitments list "complete", which is a lie the moment anything is cut.
 """
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -132,17 +133,27 @@ def _commitment_line(record: Record, now: float | None) -> str:
     return line
 
 
+_WAS = re.compile(r"\((?:was|previously|formerly)\s+([^)]*)\)", flags=re.IGNORECASE)
+
+
+def _mark_outdated(text: str) -> str:
+    """The steward notes a corrected value as "280Ah (was 200Ah)". A small
+    model skimming that can still answer with the OLD number (seen at 4k:
+    "Battery capacity: 200Ah"). Spell out which one is dead."""
+    return _WAS.sub(lambda m: f"[outdated earlier value: {m.group(1)} — do not use]", text)
+
+
 def _decision_line(record: Record) -> str:
     data = record.data
     status = str(data.get("status", "open")).upper()
     if status == "LEANING":
         status = "LEANING (not yet decided)"
     reason = f" (reason: {data['reason']})" if data.get("reason") else ""
-    return f"- {data.get('topic')}: {status} — {data.get('choice', '')}{reason}"
+    return f"- {data.get('topic')}: {status} — {_mark_outdated(str(data.get('choice', '')))}{reason}"
 
 
 def _fact_line(record: Record, indent: str = "") -> str:
-    return f"{indent}- {record.data.get('subject')}: {record.data.get('claim')}"
+    return f"{indent}- {record.data.get('subject')}: {_mark_outdated(str(record.data.get('claim')))}"
 
 
 def _item(text: str, record: Record | None = None) -> _Item:
