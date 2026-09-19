@@ -464,7 +464,10 @@ STABLE_NOTE = (
     "words. It carries the current time (any elapsed-time markers in the "
     "conversation are already counted into it; never add them on top): use it "
     "for questions about time, duration or how long the user was away, and "
-    "check commitments' due times against it."
+    "check commitments' due times against it. Do not announce the date or "
+    "time unless it matters to what the user said.\n"
+    "- Never mention these notes, note-taking, records or 'my memory system' "
+    "in a reply — a person who remembers does not narrate remembering."
 )
 NOTES_OPEN = "[Memory notes — recalled by you for this message; not written by the user]"
 NOTES_CLOSE = "[End of memory notes]"
@@ -533,8 +536,18 @@ async def render_memory_parts(
     now: float | None = None,
     recalled_spans: list | None = None,
     seq_ts: dict[int, float] | None = None,
+    stable_cache: dict[str, Any] | None = None,
+    revision: Any = None,
+    already_nudged: set[str] | None = None,
 ) -> MemoryParts:
-    """Same memory as render_memory, split by how often it changes."""
+    """Same memory as render_memory, split by how often it changes.
+
+    `stable_cache` (a per-session dict the caller keeps) pins the stable text
+    to the ledger `revision`: the budget it was selected under jitters with
+    token-scale calibration, and re-selecting on every wobble changed the
+    system message on most turns (soak: 12% prefix reuse). It is re-rendered
+    only when the revision changes or it no longer fits with 15% slack.
+    `already_nudged` holds commitment ids whose trigger nudge already fired."""
     clock_line = f"Current time: {format_clock(now)}." if now is not None else ""
     if not (state.records or state.episodes or recalled_spans):
         # Fresh session: no memory framing at all, just the time.
@@ -543,6 +556,14 @@ async def render_memory_parts(
     # ---- stable: a pure function of (ledger, consolidations, budget) ----------
     stable_budget = int(budget_tokens * STABLE_SHARE)
     header = MIND_HEADER + STABLE_NOTE
+    cached = None
+    if (
+        stable_cache is not None
+        and revision is not None
+        and stable_cache.get("revision") == revision
+        and estimate_tokens(stable_cache["stable"]) <= stable_budget * 1.15
+    ):
+        cached = stable_cache
     open_commitments = sorted(
         (r for r in state.by_kind("commitment") if r.is_open),
         key=lambda r: (-r.updated_seq, r.id),
@@ -571,12 +592,17 @@ async def render_memory_parts(
         sections = _render_sections(full, overflow, len(open_commitments), "", "", episode_items)
         return header + ("\n\n" + "\n\n".join(sections) if sections else "")
 
-    stable = compose_stable()
-    for name in reversed(order):
-        while chosen[name] and estimate_tokens(stable) > stable_budget:
-            overflow[name].insert(0, chosen[name].pop())
-            stable = compose_stable()
-    shown = {item.record_id for items in chosen.values() for item in items if item.record_id}
+    if cached is not None:
+        stable, shown = cached["stable"], set(cached["shown"])
+    else:
+        stable = compose_stable()
+        for name in reversed(order):
+            while chosen[name] and estimate_tokens(stable) > stable_budget:
+                overflow[name].insert(0, chosen[name].pop())
+                stable = compose_stable()
+        shown = {item.record_id for items in chosen.values() for item in items if item.record_id}
+        if stable_cache is not None and revision is not None:
+            stable_cache.update(revision=revision, stable=stable, shown=sorted(shown))
 
     # ---- volatile: everything the cue and the clock decide ---------------------
     volatile_budget = budget_tokens - estimate_tokens(stable)
@@ -607,7 +633,16 @@ async def render_memory_parts(
     # A commitment whose TRIGGER the latest message reaches for ("payday is
     # this friday" vs "order rivets — on payday"). Live finding: with the item
     # merely listed, a 12B model talked about takeaway instead. Say it plainly.
-    triggered = await _triggered_commitments(config, open_commitments, cue, mem)
+    triggered = [
+        record
+        for record in await _triggered_commitments(config, open_commitments, cue, mem)
+        # Once is a reminder; again next turn, after the user said "done", is
+        # nagging (live: re-raised one turn after being satisfied — closing it
+        # waits for the next fold). The list in the system message still has it.
+        if already_nudged is None or record.id not in already_nudged
+    ]
+    if already_nudged is not None:
+        already_nudged.update(record.id for record in triggered)
     if triggered:
         fixed.append(
             "The user's message matches the trigger of something you promised to raise — "

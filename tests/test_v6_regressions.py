@@ -652,3 +652,31 @@ def test_first_fold_lands_into_reserved_space(tmp_path):
     )
     assert landed.evicted_uncovered == 0
     assert landed.estimated_tokens <= hard
+
+
+def test_stable_memory_survives_budget_jitter_and_nudges_fire_once():
+    from server.mind.ledger import LedgerState, apply_ops
+    from server.mind.memory_view import render_memory_parts
+    from server.mind.config import MindConfig
+
+    state = LedgerState()
+    apply_ops(state, [{"op": "add", "kind": "fact", "subject": f"thing {i}", "claim": "detail " * 12,
+                       "core": True} for i in range(40)]
+              + [{"op": "add", "kind": "commitment", "statement": "order copper rivets", "trigger": "on payday"}],
+              fold=1, span_to=2)
+    cache, nudged = {}, set()
+
+    def render(budget, cue):
+        return asyncio.run(render_memory_parts(
+            MindConfig(), state, [], None, cue, None, budget,
+            stable_cache=cache, revision=(1, 1, 0, 0), already_nudged=nudged,
+        ))
+
+    first = render(1600, "payday is this friday")
+    assert "bring it up now" in first.volatile
+    # Calibration wobble moves the budget a little: the system text must not move.
+    assert render(1540, "anything").stable == first.stable == render(1700, "else").stable
+    # ...but a real squeeze, or a new ledger revision, re-renders it.
+    assert render(900, "anything").stable != first.stable
+    # The nudge fired once; the same trigger next turn does not nag.
+    assert "bring it up now" not in render(1600, "yes it's payday, I know").volatile

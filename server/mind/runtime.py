@@ -68,6 +68,9 @@ class _Scene:
     state: LedgerState
     threads: ThreadsView | None
     autocued: int
+    # Commitments whose trigger nudge THIS scene carries; committed to the
+    # session only for the scene that is actually sent.
+    nudged: frozenset = frozenset()
 
 
 @dataclass
@@ -104,6 +107,10 @@ class MindRuntime:
         # Previous outgoing request per session, serialized: the shared prefix
         # with the next one is what a backend's KV cache could reuse.
         self._last_request: dict[str, str] = {}
+        # Phase A: the stable memory text per session, pinned to the ledger
+        # revision; and which commitments already got their trigger nudge.
+        self._stable_cache: dict[str, dict[str, Any]] = {}
+        self._nudged: dict[str, set[str]] = {}
         # Real tokens per estimated token, learned from usage.prompt_tokens.
         # Keyed by MODEL: it is a property of the tokenizer, not the session.
         self._scale: dict[str, float] = {}
@@ -194,6 +201,7 @@ class MindRuntime:
             scene = await self._scene(session_id, events, clock, out_tools, model)
             folded = True
 
+        self._nudged.setdefault(session_id, set()).update(scene.nudged)
         # Offer recall once anything has folded out of verbatim view.
         recall_offered = self.config.recall_enabled and scene.state.covered_upto > 0
         if recall_offered:
@@ -311,9 +319,18 @@ class MindRuntime:
             seq_ts={event.seq: event.ts for event in events if event.ts},
         )
         volatile_text = ""
+        nudged_before = self._nudged.get(session_id, set())
+        nudged_trial = set(nudged_before)
         if self.config.memory_placement == "split":
+            folds = self.store.live_folds(session_id)
             parts = await render_memory_parts(
-                self.config, state, consolidations, threads, **render_args
+                self.config, state, consolidations, threads, **render_args,
+                stable_cache=self._stable_cache.setdefault(session_id, {}),
+                revision=(
+                    len(folds), folds[-1]["seq"] if folds else 0,
+                    len(consolidations), consolidations[-1]["seq"] if consolidations else 0,
+                ),
+                already_nudged=nudged_trial,
             )
             memory_text, volatile_text = parts.stable, parts.volatile
         else:
@@ -337,7 +354,10 @@ class MindRuntime:
                 else None
             ),
         )
-        return _Scene(session_id, workspace, state, threads, len(recalled or []))
+        return _Scene(
+            session_id, workspace, state, threads, len(recalled or []),
+            nudged=frozenset(nudged_trial - nudged_before),
+        )
 
     async def _await_maintenance(self, session_id: str) -> float:
         task = self._maintaining.get(session_id)
