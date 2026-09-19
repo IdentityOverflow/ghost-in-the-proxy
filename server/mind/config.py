@@ -36,6 +36,28 @@ class MindConfig(BaseModel):
     # spans (e.g. the re-fold after a deep fork) are chunked into sequential
     # passes instead of overflowing the extraction model's window.
     steward_input_tokens: int = int(os.getenv("MIND_STEWARD_INPUT_TOKENS", "2600"))
+    # Memory v6: how much of the ledger one steward pass may see (a
+    # relevance-ranked slice, not the whole thing — docs/memory-v6.md §2).
+    steward_slice_tokens: int = int(os.getenv("MIND_STEWARD_SLICE_TOKENS", "1200"))
+    # Ask the backend for JSON-schema constrained decoding on steward calls
+    # (LM Studio, llama.cpp, vLLM, most OpenRouter routes). Backends that
+    # refuse it are remembered and asked for plain JSON instead.
+    steward_json_schema: bool = os.getenv("MIND_STEWARD_JSON_SCHEMA", "1") == "1"
+    # The memory section's share of the workspace budget, with absolute
+    # bounds: small windows still get a usable scene, big windows do not get
+    # a bigger default scene (abundance causes dilution).
+    memory_fraction: float = float(os.getenv("MIND_MEMORY_FRACTION", "0.35"))
+    memory_min_tokens: int = int(os.getenv("MIND_MEMORY_MIN_TOKENS", "900"))
+    memory_max_tokens: int = int(os.getenv("MIND_MEMORY_MAX_TOKENS", "4000"))
+    # Ceiling on the assembled workspace whatever the window (estimated
+    # tokens): a 128k window must not reintroduce transcript stuffing.
+    workspace_cap_tokens: int = int(os.getenv("MIND_WORKSPACE_CAP", "16000"))
+    # Fold in the background after the reply (the next request for the same
+    # session waits for an in-flight fold). 0 = only fold on the request path.
+    background_fold: bool = os.getenv("MIND_BACKGROUND_FOLD", "1") == "1"
+    # Consolidate leaf episodes into era lines once this many are older than
+    # the recent tail; this many eras fold into an epoch.
+    era_size: int = int(os.getenv("MIND_ERA_SIZE", "6"))
     # Model used for summarization/extraction; empty = the request's model.
     extraction_model: str | None = os.getenv("MIND_EXTRACTION_MODEL") or None
     # Hard cap on extraction-call output (steward/summarizer). Roomy enough

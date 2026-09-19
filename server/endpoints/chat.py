@@ -34,6 +34,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     mind = get_mind_runtime()
     session_id: str | None = None
     recall_offered = False
+    estimated_tokens = 0
     # Fake clock (v4 eval harness): trusted only when explicitly enabled,
     # otherwise clients could spoof the mind's sense of time.
     clock: float | None = None
@@ -52,6 +53,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             outgoing_messages = prepared.messages
             session_id = prepared.session_id
             recall_offered = prepared.recall_offered
+            estimated_tokens = prepared.estimated_tokens
             if prepared.tools_scoped:
                 tools_out = prepared.tools or []
                 if tools_out:
@@ -90,6 +92,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             # chunk before the hold resolves.
             stream_payload = payload
             hops = 0
+            recall_chars = 0
             complete = False
             # Collector of the bytes the client actually saw; recall
             # exchanges are held back, never forwarded, never recorded.
@@ -125,6 +128,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                             held.append(raw)
                     else:
                         complete = True
+                    if hops == 0 and mind is not None and session_id is not None:
+                        mind.note_usage(session_id, estimated_tokens, collector.prompt_tokens)
                     if not complete or held is None:
                         break  # disconnect, or a fully-forwarded stream
                     # Stream ended while held: pure-recall reply (or nothing).
@@ -137,9 +142,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         hops += 1
                         followup = list(stream_payload["messages"]) + [message]
                         for call in calls:
-                            content = await mind.resolve_recall(
-                                session_id, call.get("function", {}).get("arguments") or "{}"
+                            content = await _recall(
+                                mind, session_id, call.get("function", {}).get("arguments") or "{}",
+                                recall_chars,
                             )
+                            recall_chars += len(content)
                             followup.append(
                                 {
                                     "role": "tool",
@@ -175,6 +182,10 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
     try:
         resp = await provider.chat_completions(payload)
+        if mind is not None and session_id is not None:
+            mind.note_usage(
+                session_id, estimated_tokens, (resp.get("usage") or {}).get("prompt_tokens")
+            )
         # Recall interception (v3): recall is OUR tool, invisible to the
         # client. Resolve it proxy-side and re-query; the exchange never
         # enters the event store (the client's next transcript won't contain
@@ -182,6 +193,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         # (recall + client tools) pass through untouched: partially executing
         # a tool batch would leave the client with dangling call ids.
         hops = 0
+        recall_chars = 0
         while mind is not None and session_id is not None and mind_config.recall_enabled:
             message = resp["choices"][0]["message"]
             calls = message.get("tool_calls") or []
@@ -196,9 +208,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             hops += 1
             followup = list(payload["messages"]) + [message]
             for call in recall_calls:
-                content = await mind.resolve_recall(
-                    session_id, call.get("function", {}).get("arguments") or "{}"
+                content = await _recall(
+                    mind, session_id, call.get("function", {}).get("arguments") or "{}",
+                    recall_chars,
                 )
+                recall_chars += len(content)
                 followup.append(
                     {
                         "role": "tool",
@@ -223,6 +237,15 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     return JSONResponse(resp)
 
 
+async def _recall(mind, session_id: str, arguments: str, spent_chars: int) -> str:
+    """Resolve one recall call under the request-wide recall budget: hops pile
+    on top of an already-assembled workspace, and unbounded they overflow a
+    small window on their own."""
+    if spent_chars >= 2 * mind.recall_char_budget():
+        return "recall: the memory budget for this reply is used up — answer from what you already have."
+    return await mind.resolve_recall(session_id, arguments)
+
+
 class _DeltaCollector:
     """Accumulate an assistant message from raw SSE chunks (tolerant parser).
 
@@ -236,6 +259,8 @@ class _DeltaCollector:
         self._buffer = b""
         self._content: list[str] = []
         self._tool_calls: dict[int, dict] = {}
+        # usage.prompt_tokens when the backend streams it (include_usage).
+        self.prompt_tokens: int | None = None
 
     def feed(self, raw: bytes) -> None:
         self._buffer += raw
@@ -248,8 +273,17 @@ class _DeltaCollector:
             if data == "[DONE]":
                 continue
             try:
-                delta = json.loads(data)["choices"][0].get("delta", {})
-            except (ValueError, KeyError, IndexError):
+                chunk = json.loads(data)
+            except ValueError:
+                continue
+            if not isinstance(chunk, dict):
+                continue
+            usage = chunk.get("usage")
+            if isinstance(usage, dict) and usage.get("prompt_tokens"):
+                self.prompt_tokens = usage["prompt_tokens"]
+            try:
+                delta = chunk["choices"][0].get("delta", {})
+            except (KeyError, IndexError, AttributeError):
                 continue
             piece = delta.get("content")
             if piece:

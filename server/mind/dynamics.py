@@ -69,10 +69,17 @@ class ThreadState:
     activation: float = 0.6  # fresh threads start admitted, then must earn it
     importance: float = 0.3
     facts: list[dict[str, Any]] = field(default_factory=list)  # attached ledger facts
+    # Human-readable slug. Since memory v6 `key` is a runtime id ("t3"); the
+    # name is what renders and what carries lexical signal.
+    name: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            self.name = self.key
 
     def tokens(self) -> set[str]:
         text = " ".join(
-            [self.key.replace("-", " "), self.summary, " ".join(self.anchors)]
+            [self.name.replace("-", " "), self.summary, " ".join(self.anchors)]
             + [str(fact.get("subject", "")) + " " + str(fact.get("claim", "")) for fact in self.facts]
         )
         return tokenize(text)

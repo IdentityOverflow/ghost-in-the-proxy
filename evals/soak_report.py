@@ -131,24 +131,47 @@ def render(results_path: Path, metrics_path: Path | None) -> str:
 
     if folds:
         failed = [fold for fold in folds if not fold["ok"]]
-        lost = sum(len(fold["lost_keys"]) for fold in folds)
         lines.append("## Folds")
         lines.append("")
-        lines.append(
-            f"{len(folds)} folds, {len(failed)} fell back to prose "
-            f"({100 * len(failed) / len(folds):.0f}%), "
-            f"mean {sum(f['seconds'] for f in folds) / len(folds):.1f}s, "
-            f"{lost} ledger keys lost/renamed across all folds."
+        summary = (
+            f"{len(folds)} folds, {len(failed)} degraded "
+            f"({100 * len(failed) / len(folds):.0f}%: prose fallback, error or stale), "
+            f"mean {sum(f['seconds'] for f in folds) / len(folds):.1f}s"
         )
-        lines.append("")
-        lines.append("| # | upto seq | ok | s | ledger before -> after | lost keys |")
-        lines.append("|---|---|---|---|---|---|")
-        for number, fold in enumerate(folds, start=1):
-            lines.append(
-                f"| {number} | {fold['upto_seq']} | {'ok' if fold['ok'] else 'FALLBACK'} | "
-                f"{fold['seconds']} | {fold['ledger_before']} -> {fold['ledger_after']} | "
-                f"{', '.join(fold['lost_keys'][:6])}{' …' if len(fold['lost_keys']) > 6 else ''} |"
+        v6 = "ops_applied" in folds[0]
+        if v6:
+            on_request = sum(1 for fold in folds if fold.get("path") == "request")
+            summary += (
+                f"; {sum(f['ops_applied'] for f in folds)} ops applied, "
+                f"{sum(len(f['ops_dropped']) for f in folds)} dropped, "
+                f"{sum(f['deduped'] for f in folds)} de-duplicated; "
+                f"{on_request} folds ran on the request path (user waited)."
             )
+        else:
+            lost = sum(len(fold["lost_keys"]) for fold in folds)
+            summary += f"; {lost} ledger keys lost/renamed across all folds."
+        lines.append(summary)
+        lines.append("")
+        if v6:
+            lines.append("| # | path | covered | ok | s | ledger before -> after | ops ok/dropped/dedup | note |")
+            lines.append("|---|---|---|---|---|---|---|---|")
+            for number, fold in enumerate(folds, start=1):
+                note = (fold.get("error") or "; ".join(fold["ops_dropped"][:2]))[:80].replace("|", "/")
+                lines.append(
+                    f"| {number} | {fold.get('path', '')} | {fold['covered_upto']} | "
+                    f"{'ok' if fold['ok'] else 'DEGRADED'} | {fold['seconds']} | "
+                    f"{fold['ledger_before']} -> {fold['ledger_after']} | "
+                    f"{fold['ops_applied']}/{len(fold['ops_dropped'])}/{fold['deduped']} | {note} |"
+                )
+        else:
+            lines.append("| # | upto seq | ok | s | ledger before -> after | lost keys |")
+            lines.append("|---|---|---|---|---|---|")
+            for number, fold in enumerate(folds, start=1):
+                lines.append(
+                    f"| {number} | {fold['upto_seq']} | {'ok' if fold['ok'] else 'FALLBACK'} | "
+                    f"{fold['seconds']} | {fold['ledger_before']} -> {fold['ledger_after']} | "
+                    f"{', '.join(fold['lost_keys'][:6])}{' …' if len(fold['lost_keys']) > 6 else ''} |"
+                )
         lines.append("")
     return "\n".join(lines)
 

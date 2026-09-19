@@ -33,46 +33,45 @@ CREATE TABLE IF NOT EXISTS events (
     ts REAL DEFAULT (unixepoch('subsec')),
     PRIMARY KEY (session, seq)
 );
-CREATE TABLE IF NOT EXISTS summaries (
+-- Memory v6: the fold log. One immutable row per fold carries everything
+-- the fold derived — steward ops, the leaf episode, and (via span_to) the
+-- coverage watermark — so a fold commits or fails atomically, and ledger
+-- state is a pure replay of the live rows (server/mind/ledger.py).
+CREATE TABLE IF NOT EXISTS folds (
     session TEXT NOT NULL,
-    seq INTEGER NOT NULL,           -- creation order among summaries
-    upto_seq INTEGER NOT NULL,      -- covers live events with seq <= upto_seq
+    seq INTEGER NOT NULL,           -- creation order among folds
+    span_from INTEGER NOT NULL,
+    span_to INTEGER NOT NULL,       -- covers live events with seq <= span_to
+    kind TEXT NOT NULL,             -- 'steward' | 'prose' (episode-only fallback)
+    ops TEXT NOT NULL,              -- JSON list of steward ops (may be [])
+    episode TEXT NOT NULL,
+    superseded INTEGER NOT NULL DEFAULT 0,
+    ts REAL DEFAULT (unixepoch('subsec')),
+    PRIMARY KEY (session, seq)
+);
+-- Consolidations are a disposable index over leaf episodes (level 1 = era
+-- over folds, level 2 = epoch over eras). Never truth: regenerated after
+-- a fork, and the leaves they summarize are never deleted.
+CREATE TABLE IF NOT EXISTS consolidations (
+    session TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    level INTEGER NOT NULL,
+    child_from INTEGER NOT NULL,    -- first fold seq (level 1) / consolidation seq (level 2+)
+    child_to INTEGER NOT NULL,
+    span_from INTEGER NOT NULL,     -- event span, for fork invalidation
+    span_to INTEGER NOT NULL,
     content TEXT NOT NULL,
     superseded INTEGER NOT NULL DEFAULT 0,
     ts REAL DEFAULT (unixepoch('subsec')),
     PRIMARY KEY (session, seq)
 );
-CREATE TABLE IF NOT EXISTS records (
-    session TEXT NOT NULL,
-    seq INTEGER NOT NULL,           -- creation order among records
-    generation INTEGER NOT NULL,    -- steward pass that produced it
-    kind TEXT NOT NULL,             -- 'fact' | 'decision' | 'commitment'
-    payload TEXT NOT NULL,          -- JSON per kind
-    provenance_seq INTEGER NOT NULL,
-    superseded INTEGER NOT NULL DEFAULT 0,
-    ts REAL DEFAULT (unixepoch('subsec')),
-    PRIMARY KEY (session, seq)
-);
-CREATE TABLE IF NOT EXISTS episodes (
-    session TEXT NOT NULL,
-    seq INTEGER NOT NULL,
-    span_from INTEGER NOT NULL,
-    span_to INTEGER NOT NULL,
-    summary TEXT NOT NULL,
-    superseded INTEGER NOT NULL DEFAULT 0,
-    ts REAL DEFAULT (unixepoch('subsec')),
-    PRIMARY KEY (session, seq)
-);
-CREATE TABLE IF NOT EXISTS threads (
-    session TEXT NOT NULL,
-    seq INTEGER NOT NULL,           -- creation order among thread rows
-    generation INTEGER NOT NULL,    -- steward pass that produced it
-    key TEXT NOT NULL,              -- stable slug; carries dynamics across generations
-    payload TEXT NOT NULL,          -- JSON: kind, summary, anchors[], open_questions[]
-    provenance_seq INTEGER NOT NULL,
-    superseded INTEGER NOT NULL DEFAULT 0,
-    ts REAL DEFAULT (unixepoch('subsec')),
-    PRIMARY KEY (session, seq)
+-- Text-embedding cache for derived text (ledger records, episodes). Keyed
+-- by content hash, so it needs no invalidation and survives forks.
+CREATE TABLE IF NOT EXISTS embed_cache (
+    model TEXT NOT NULL,
+    hash TEXT NOT NULL,
+    vec BLOB NOT NULL,
+    PRIMARY KEY (model, hash)
 );
 -- Deliberate exception to the append-only invariant: activation/importance
 -- are runtime-computed dynamics, reconstructible from events — a cache of
@@ -267,35 +266,23 @@ class MindStore:
                 (by_seq, session_id, from_seq, by_seq),
             )
             # Derived state built from superseded ground truth is invalid.
-            # (Ledger generations from before the fork are not auto-restored;
-            # the next steward pass rebuilds from live events. v1 tradeoff.)
+            # A fold whose span reaches the fork point goes entirely; its
+            # surviving prefix is re-folded (coverage falls back with it).
+            # Earlier folds are untouched, so the replayed ledger is exactly
+            # the state as of the fork — restore is a query, not a feature.
             self._conn.execute(
-                "UPDATE summaries SET superseded = 1 WHERE session = ? AND upto_seq >= ?",
+                "UPDATE folds SET superseded = 1 WHERE session = ? AND span_to >= ?",
                 (session_id, from_seq),
             )
             self._conn.execute(
-                "UPDATE records SET superseded = 1 WHERE session = ? AND provenance_seq >= ?",
+                "UPDATE consolidations SET superseded = 1 WHERE session = ? AND span_to >= ?",
                 (session_id, from_seq),
             )
-            self._conn.execute(
-                "UPDATE episodes SET superseded = 1 WHERE session = ? AND span_to >= ?",
-                (session_id, from_seq),
-            )
-            self._conn.execute(
-                "UPDATE threads SET superseded = 1 WHERE session = ? AND provenance_seq >= ?",
-                (session_id, from_seq),
-            )
+            # Attention is a cache reconstructible from events: drop it and
+            # let the next tick replay the live user turns.
+            self._conn.execute("DELETE FROM thread_dynamics WHERE session = ?", (session_id,))
 
-    # -- summaries ----------------------------------------------------------
-
-    def latest_summary(self, session_id: str) -> tuple[int, str] | None:
-        """Returns (upto_seq, content) of the newest valid summary, if any."""
-        row = self._conn.execute(
-            "SELECT upto_seq, content FROM summaries WHERE session = ? AND superseded = 0"
-            " ORDER BY seq DESC LIMIT 1",
-            (session_id,),
-        ).fetchone()
-        return (row[0], row[1]) if row else None
+    # -- embeddings ---------------------------------------------------------
 
     def put_embedding(self, session_id: str, seq: int, model: str, vec: bytes) -> None:
         with self._lock, self._conn:
@@ -314,111 +301,113 @@ class MindStore:
                 )
             ]
 
-    def append_summary(self, session_id: str, upto_seq: int, content: str) -> None:
+    def get_cached_vectors(self, model: str, hashes: list[str]) -> dict[str, bytes]:
+        if not hashes:
+            return {}
+        found: dict[str, bytes] = {}
+        with self._lock:
+            for start in range(0, len(hashes), 500):
+                chunk = hashes[start : start + 500]
+                marks = ",".join("?" for _ in chunk)
+                for row in self._conn.execute(
+                    f"SELECT hash, vec FROM embed_cache WHERE model = ? AND hash IN ({marks})",
+                    (model, *chunk),
+                ):
+                    found[row[0]] = row[1]
+        return found
+
+    def put_cached_vectors(self, model: str, vectors: dict[str, bytes]) -> None:
         with self._lock, self._conn:
-            row = self._conn.execute(
-                "SELECT COALESCE(MAX(seq), 0) FROM summaries WHERE session = ?", (session_id,)
-            ).fetchone()
-            self._conn.execute(
-                "INSERT INTO summaries (session, seq, upto_seq, content) VALUES (?, ?, ?, ?)",
-                (session_id, row[0] + 1, upto_seq, content),
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO embed_cache (model, hash, vec) VALUES (?, ?, ?)",
+                [(model, key, vec) for key, vec in vectors.items()],
             )
 
-    # -- structured records (v1 steward) --------------------------------------
+    # -- fold log (memory v6) ---------------------------------------------------
 
-    def live_records(self, session_id: str) -> dict[str, list[dict[str, Any]]]:
-        """Current ledger, grouped by kind (facts / decisions / commitments)."""
+    def live_folds(self, session_id: str) -> list[dict[str, Any]]:
         rows = self._conn.execute(
-            "SELECT kind, payload FROM records WHERE session = ? AND superseded = 0 ORDER BY seq",
+            "SELECT seq, span_from, span_to, kind, ops, episode FROM folds"
+            " WHERE session = ? AND superseded = 0 ORDER BY seq",
             (session_id,),
         ).fetchall()
-        grouped: dict[str, list[dict[str, Any]]] = {}
-        for kind, payload in rows:
-            grouped.setdefault(kind, []).append(json.loads(payload))
-        return grouped
+        return [
+            {
+                "seq": row[0],
+                "span_from": row[1],
+                "span_to": row[2],
+                "kind": row[3],
+                "ops": json.loads(row[4]),
+                "episode": row[5],
+            }
+            for row in rows
+        ]
 
-    def replace_records(
+    def append_fold(
         self,
         session_id: str,
-        records: dict[str, list[dict[str, Any]]],
-        provenance_seq: int,
-    ) -> None:
-        """Version the whole ledger: supersede the old generation, append the new.
-
-        The steward proposes the complete updated state each pass; generation
-        versioning keeps application deterministic (no record matching) while
-        preserving the append-only history.
-        """
+        span_from: int,
+        span_to: int,
+        ops: list[dict[str, Any]],
+        episode: str,
+        kind: str = "steward",
+    ) -> int | None:
+        """Commit one fold atomically. Returns its seq, or None when the span
+        is no longer live (a fork landed inside it while the steward was
+        thinking) — a stale fold must never enter the log."""
         with self._lock, self._conn:
+            live = self._conn.execute(
+                "SELECT COUNT(*) FROM events WHERE session = ? AND seq IN (?, ?)"
+                " AND superseded_by IS NULL",
+                (session_id, span_from, span_to),
+            ).fetchone()[0]
+            if live < len({span_from, span_to}):
+                return None
             row = self._conn.execute(
-                "SELECT COALESCE(MAX(generation), 0), COALESCE(MAX(seq), 0) FROM records"
-                " WHERE session = ?",
-                (session_id,),
+                "SELECT COALESCE(MAX(seq), 0) FROM folds WHERE session = ?", (session_id,)
             ).fetchone()
-            generation, seq = row[0] + 1, row[1]
+            seq = row[0] + 1
             self._conn.execute(
-                "UPDATE records SET superseded = 1 WHERE session = ? AND superseded = 0",
-                (session_id,),
+                "INSERT INTO folds (session, seq, span_from, span_to, kind, ops, episode)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id, seq, span_from, span_to, kind,
+                    json.dumps(ops, ensure_ascii=False), episode,
+                ),
             )
-            for kind, items in records.items():
-                for item in items:
-                    seq += 1
-                    self._conn.execute(
-                        "INSERT INTO records (session, seq, generation, kind, payload, provenance_seq)"
-                        " VALUES (?, ?, ?, ?, ?, ?)",
-                        (
-                            session_id,
-                            seq,
-                            generation,
-                            kind,
-                            json.dumps(item, ensure_ascii=False, sort_keys=True),
-                            provenance_seq,
-                        ),
-                    )
+        return seq
 
-    # -- threads (v2 CRS) ------------------------------------------------------
-
-    def live_threads(self, session_id: str) -> list[dict[str, Any]]:
-        """Current thread structure: payload dicts with 'key' merged in."""
+    def live_consolidations(self, session_id: str) -> list[dict[str, Any]]:
         rows = self._conn.execute(
-            "SELECT key, payload FROM threads WHERE session = ? AND superseded = 0 ORDER BY seq",
+            "SELECT seq, level, child_from, child_to, span_from, span_to, content"
+            " FROM consolidations WHERE session = ? AND superseded = 0 ORDER BY seq",
             (session_id,),
         ).fetchall()
-        return [{"key": row[0], **json.loads(row[1])} for row in rows]
+        keys = ("seq", "level", "child_from", "child_to", "span_from", "span_to", "content")
+        return [dict(zip(keys, row)) for row in rows]
 
-    def replace_threads(
-        self, session_id: str, threads: list[dict[str, Any]], provenance_seq: int
+    def append_consolidation(
+        self,
+        session_id: str,
+        level: int,
+        child_from: int,
+        child_to: int,
+        span_from: int,
+        span_to: int,
+        content: str,
     ) -> None:
-        """Version the whole thread set, same pattern as replace_records."""
         with self._lock, self._conn:
             row = self._conn.execute(
-                "SELECT COALESCE(MAX(generation), 0), COALESCE(MAX(seq), 0) FROM threads"
-                " WHERE session = ?",
+                "SELECT COALESCE(MAX(seq), 0) FROM consolidations WHERE session = ?",
                 (session_id,),
             ).fetchone()
-            generation, seq = row[0] + 1, row[1]
             self._conn.execute(
-                "UPDATE threads SET superseded = 1 WHERE session = ? AND superseded = 0",
-                (session_id,),
+                "INSERT INTO consolidations (session, seq, level, child_from, child_to,"
+                " span_from, span_to, content) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (session_id, row[0] + 1, level, child_from, child_to, span_from, span_to, content),
             )
-            for thread in threads:
-                key = str(thread.get("key") or "").strip()
-                if not key:
-                    continue
-                payload = {k: v for k, v in thread.items() if k != "key"}
-                seq += 1
-                self._conn.execute(
-                    "INSERT INTO threads (session, seq, generation, key, payload, provenance_seq)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        session_id,
-                        seq,
-                        generation,
-                        key,
-                        json.dumps(payload, ensure_ascii=False, sort_keys=True),
-                        provenance_seq,
-                    ),
-                )
+
+    # -- thread dynamics (v2 CRS) ---------------------------------------------
 
     def get_dynamics(self, session_id: str) -> dict[str, tuple[float, float, int]]:
         """key -> (activation, importance, updated_seq)."""
@@ -440,24 +429,4 @@ class MindStore:
                 " activation = excluded.activation, importance = excluded.importance,"
                 " updated_seq = excluded.updated_seq",
                 (session_id, key, activation, importance, updated_seq),
-            )
-
-    # -- episodes -------------------------------------------------------------
-
-    def live_episodes(self, session_id: str) -> list[tuple[int, int, str]]:
-        rows = self._conn.execute(
-            "SELECT span_from, span_to, summary FROM episodes WHERE session = ? AND superseded = 0"
-            " ORDER BY seq",
-            (session_id,),
-        ).fetchall()
-        return [(row[0], row[1], row[2]) for row in rows]
-
-    def append_episode(self, session_id: str, span_from: int, span_to: int, summary: str) -> None:
-        with self._lock, self._conn:
-            row = self._conn.execute(
-                "SELECT COALESCE(MAX(seq), 0) FROM episodes WHERE session = ?", (session_id,)
-            ).fetchone()
-            self._conn.execute(
-                "INSERT INTO episodes (session, seq, span_from, span_to, summary) VALUES (?, ?, ?, ?, ?)",
-                (session_id, row[0] + 1, span_from, span_to, summary),
             )

@@ -1,5 +1,15 @@
+import asyncio
+import os
+
 import httpx
 from typing import Optional, Dict, Any
+
+# Opt-in retry of transient upstream failures on NON-streaming calls (shared
+# routes like OpenRouter rate-limit per upstream; a 429 mid-conversation should
+# not kill a long run or a background fold). 0 keeps the faithful-passthrough
+# default: the client sees exactly what the backend said, first time.
+PROVIDER_RETRIES = int(os.getenv("PROVIDER_RETRIES", "0"))
+RETRY_STATUSES = {429, 500, 502, 503, 504, 529}
 
 
 class OpenAILikeProvider:
@@ -30,8 +40,17 @@ class OpenAILikeProvider:
 
     async def chat_completions(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         url = f"{self.base_url}/v1/chat/completions"
-        async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(url, headers=self._headers(), json=payload)
+        async with httpx.AsyncClient(timeout=300) as client:
+            for attempt in range(PROVIDER_RETRIES + 1):
+                r = await client.post(url, headers=self._headers(), json=payload)
+                if r.status_code in RETRY_STATUSES and attempt < PROVIDER_RETRIES:
+                    try:
+                        delay = float(r.headers.get("retry-after", ""))
+                    except ValueError:
+                        delay = 0.0
+                    await asyncio.sleep(min(max(delay, 3.0 * 2**attempt), 60.0))
+                    continue
+                break
             r.raise_for_status()
             return r.json()
 

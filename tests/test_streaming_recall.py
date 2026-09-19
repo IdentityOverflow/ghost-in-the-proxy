@@ -120,7 +120,7 @@ def folded_transcript(runtime) -> tuple[list[dict], str]:
         {"role": "user", "content": "what was the exact error line?"},
     ]
     recon = reconcile(runtime.store, transcript)
-    runtime.store.append_summary(recon.session_id, 2, "user hit a database error")
+    runtime.store.append_fold(recon.session_id, 1, 2, [], "user hit a database error")
     return transcript, recon.session_id
 
 
