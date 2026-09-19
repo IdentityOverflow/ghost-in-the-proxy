@@ -7,6 +7,7 @@ similarity is additive when it has one (embedding), exactly the v5 split.
 """
 
 import math
+import re
 from dataclasses import dataclass
 
 from .dynamics import tokenize
@@ -37,6 +38,15 @@ async def score_texts(
     sims: list[float] | None = None
     if mem is not None and texts and cue.strip():
         sims = await mem.text_sims(cue, texts)
+        if sims is not None:
+            # A multi-part question ("the van's name, the dog's name, and the
+            # battery size?") embeds as a blur that matches none of its parts
+            # well — observed live: the battery record missed a quick-fire
+            # round. Score each clause too and keep the best.
+            for clause in _clauses(cue):
+                part = await mem.text_sims(clause, texts)
+                if part is not None:
+                    sims = [max(whole, piece) for whole, piece in zip(sims, part)]
     scored = []
     for index, text in enumerate(texts):
         tokens = tokenize(text)
@@ -49,3 +59,15 @@ async def score_texts(
             hits = 2
         scored.append(Scored(index, lexical + sim, hits, sim))
     return scored
+
+
+MAX_CLAUSES = 4
+CLAUSE_CUE_CHAR_CAP = 400  # long cues (a fold span) are not questions to split
+
+
+def _clauses(cue: str) -> list[str]:
+    if len(cue) > CLAUSE_CUE_CHAR_CAP:
+        return []
+    parts = [part.strip() for part in re.split(r"[?.!;:,]|\s+—\s+|\s+and\s+", cue)]
+    clauses = [part for part in parts if len(tokenize(part)) >= 2]
+    return clauses[:MAX_CLAUSES] if len(clauses) > 1 else []

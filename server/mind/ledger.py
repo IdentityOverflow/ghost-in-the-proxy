@@ -171,6 +171,26 @@ def _src(op: dict[str, Any]) -> int | None:
         return None
 
 
+def _infer_kind(op: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """Best-effort reading of an `add` that lost its kind (observed live under
+    loose constrained decoding: {"op":"add","topic":X,"trigger":"<the fact>
+    (core: true)"}). Real information is in there; recover it rather than
+    drop it. Returns (possibly rewritten op, kind or "")."""
+    if op.get("claim") or op.get("subject"):
+        return op, "fact"
+    if op.get("statement"):
+        return op, "commitment"
+    if op.get("choice") or op.get("status"):
+        return op, "decision"
+    if op.get("topic") and op.get("trigger"):
+        text = str(op["trigger"])
+        core = bool(re.search(r"\(core:\s*true\)", text, flags=re.IGNORECASE))
+        text = re.sub(r"\s*\(core:\s*(true|false)\)\s*", "", text, flags=re.IGNORECASE).strip()
+        rewritten = {k: v for k, v in op.items() if k not in ("topic", "trigger")}
+        return {**rewritten, "kind": "fact", "subject": op["topic"], "claim": text, "core": core}, "fact"
+    return op, ""
+
+
 def apply_ops(
     state: LedgerState,
     ops: list[Any],
@@ -240,6 +260,8 @@ def apply_ops(
 
         if verb == "add":
             kind = str(op.get("kind", "")).lower()
+            if kind not in RECORD_KINDS:
+                op, kind = _infer_kind(op)
             if kind not in RECORD_KINDS:
                 report.dropped.append(f"add with unknown kind {kind!r}")
                 continue

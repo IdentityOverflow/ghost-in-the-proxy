@@ -40,8 +40,10 @@ MIND_HEADER = (
     "not vague phrases like 'finalizing the architecture'.\n"
     "- Never invent decisions, agreements, or tracked items that are not in "
     "these records or the recent turns. This memory shows what is relevant "
-    "now, not everything: if something seems missing, say you would need to "
-    "look it up rather than guessing."
+    "now, not everything. If the user refers to something from earlier that "
+    "you cannot find here, call recall(...) with a few plausible search "
+    "words BEFORE answering; only if recall finds nothing, say you do not "
+    "have it. Never fill the gap with a guess."
 )
 
 RECALLED_SPAN_CHAR_CAP = 400

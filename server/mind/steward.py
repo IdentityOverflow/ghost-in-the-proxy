@@ -69,44 +69,78 @@ EPISODE_SYSTEM = (
     "leaning) and promise exact. Plain text only."
 )
 
+def _op(required: list[str], **properties: Any) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": False,
+    }
+
+
+_TEXT = {"type": "string"}
+_SRC = {"type": "integer"}
+_THREAD_KIND = {"type": "string", "enum": ["topic", "aside", "inquiry"]}
+_DECISION_STATUS = {"type": "string", "enum": ["decided", "leaning", "open"]}
+
+# A DISCRIMINATED union, not one bag of optional fields. Under the loose
+# first version a constrained sampler could wander into any key: observed
+# live, a whole fold of {"op":"add","topic":...,"trigger":"<the actual
+# fact>"} with no kind — every op dropped, a decision lost. Each shape now
+# names its required fields and forbids the others.
 OP_SCHEMA = {
     "name": "memory_ops",
-    "strict": False,
+    "strict": True,
     "schema": {
         "type": "object",
         "properties": {
             "ops": {
                 "type": "array",
                 "items": {
-                    "type": "object",
-                    "properties": {
-                        "op": {"type": "string", "enum": ["thread", "add", "update", "close"]},
-                        "id": {"type": "string"},
-                        "kind": {"type": "string"},
-                        "name": {"type": "string"},
-                        "summary": {"type": "string"},
-                        "anchors": {"type": "array", "items": {"type": "string"}},
-                        "open_questions": {"type": "array", "items": {"type": "string"}},
-                        "subject": {"type": "string"},
-                        "claim": {"type": "string"},
-                        "topic": {"type": "string"},
-                        "status": {"type": "string"},
-                        "choice": {"type": "string"},
-                        "reason": {"type": "string"},
-                        "actor": {"type": "string"},
-                        "statement": {"type": "string"},
-                        "trigger": {"type": "string"},
-                        "due": {"type": ["string", "null"]},
-                        "thread": {"type": "string"},
-                        "core": {"type": "boolean"},
-                        "src": {"type": "integer"},
-                    },
-                    "required": ["op"],
+                    "anyOf": [
+                        _op(
+                            ["op", "id", "name", "kind", "summary"],
+                            op={"const": "thread"}, id=_TEXT, name=_TEXT, kind=_THREAD_KIND,
+                            summary=_TEXT,
+                            anchors={"type": "array", "items": _TEXT},
+                            open_questions={"type": "array", "items": _TEXT},
+                        ),
+                        _op(
+                            ["op", "kind", "subject", "claim", "core"],
+                            op={"const": "add"}, kind={"const": "fact"}, subject=_TEXT,
+                            claim=_TEXT, thread=_TEXT, core={"type": "boolean"}, src=_SRC,
+                        ),
+                        _op(
+                            ["op", "kind", "topic", "status", "choice"],
+                            op={"const": "add"}, kind={"const": "decision"}, topic=_TEXT,
+                            status=_DECISION_STATUS, choice=_TEXT, reason=_TEXT, thread=_TEXT,
+                            src=_SRC,
+                        ),
+                        _op(
+                            ["op", "kind", "actor", "statement", "trigger"],
+                            op={"const": "add"}, kind={"const": "commitment"},
+                            actor={"type": "string", "enum": ["user", "assistant"]},
+                            statement=_TEXT, trigger=_TEXT, due={"type": ["string", "null"]},
+                            src=_SRC,
+                        ),
+                        _op(
+                            ["op", "id"],
+                            op={"const": "update"}, id=_TEXT, claim=_TEXT, choice=_TEXT,
+                            status=_TEXT, reason=_TEXT, statement=_TEXT, trigger=_TEXT,
+                            due={"type": ["string", "null"]}, core={"type": "boolean"}, src=_SRC,
+                        ),
+                        _op(
+                            ["op", "id", "status"],
+                            op={"const": "close"}, id=_TEXT,
+                            status={"type": "string", "enum": ["done", "dropped"]},
+                        ),
+                    ]
                 },
             },
-            "episode": {"type": "string"},
+            "episode": _TEXT,
         },
         "required": ["ops", "episode"],
+        "additionalProperties": False,
     },
 }
 

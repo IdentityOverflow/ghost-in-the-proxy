@@ -24,9 +24,12 @@ RECALL_TOOL = {
         "description": (
             "Search your own verbatim memory of THIS conversation for earlier "
             "material that is no longer in view: exact quotes, pasted logs or "
-            "tracebacks, code, commands, numbers, names. Use it whenever the "
-            "user asks for exact wording or a detail you cannot see verbatim "
-            "right now. Returns the matching earlier messages word for word."
+            "tracebacks, code, commands, numbers, names, one-off things the "
+            "user mentioned in passing. Use it whenever the user asks for "
+            "exact wording, or refers to something from earlier that you "
+            "cannot see right now — try a few different plausible words if "
+            "the first search finds nothing. Returns the matching earlier "
+            "messages word for word."
         ),
         "parameters": {
             "type": "object",

@@ -477,3 +477,47 @@ def test_request_does_not_hang_behind_stuck_maintenance(tmp_path, monkeypatch):
         await runtime.drain()
 
     asyncio.run(go())
+
+
+def test_add_without_kind_is_recovered_not_dropped():
+    # Live shape from a loosely-constrained fold: the fact text sat in
+    # "trigger", the key in "topic", no kind anywhere — a decision was lost.
+    from server.mind.ledger import LedgerState, apply_ops
+
+    state = LedgerState()
+    report = apply_ops(state, [
+        {"op": "add", "topic": "heater", "trigger": "Mara ordered the Autoterm 2D diesel heater. (core: true)"},
+        {"op": "add", "statement": "remind Mara to book the ferry", "trigger": "before June"},
+        {"op": "add", "topic": "paint", "status": "decided", "choice": "Drift Sage"},
+        {"op": "add", "thread": "t9"},
+    ], fold=1, span_to=4)
+    kinds = sorted(record.kind for record in state.records.values())
+    assert kinds == ["commitment", "decision", "fact"]
+    fact = next(r for r in state.records.values() if r.kind == "fact")
+    assert fact.data["subject"] == "heater" and fact.data["core"] is True
+    assert fact.data["claim"] == "Mara ordered the Autoterm 2D diesel heater."
+    assert len(report.dropped) == 1  # the op with nothing recoverable
+
+
+def test_steward_schema_is_a_discriminated_union():
+    from server.mind.steward import OP_SCHEMA
+
+    shapes = OP_SCHEMA["schema"]["properties"]["ops"]["items"]["anyOf"]
+    assert all(shape["additionalProperties"] is False for shape in shapes)
+    fact = next(s for s in shapes if s["properties"].get("kind") == {"const": "fact"})
+    assert {"subject", "claim"} <= set(fact["required"]) and "trigger" not in fact["properties"]
+
+
+def test_multi_part_cue_scores_each_clause():
+    from server.mind.relevance import _clauses, score_texts
+
+    class ClauseMem:
+        async def text_sims(self, query, texts):
+            # The blurred whole question matches nothing; one clause does.
+            return [0.9 if query.strip() == "the battery size" and "280" in t else 0.1 for t in texts]
+
+    cue = "Quick-fire round: the van's name, the dog's name, and the battery size?"
+    assert "the battery size" in _clauses(cue)
+    assert _clauses("What size was the fresh water tank I got?") == []
+    scored = asyncio.run(score_texts(cue, ["electrical system: 280Ah LiFePO4", "paint: green"], ClauseMem()))
+    assert scored[0].matched and not scored[1].matched
