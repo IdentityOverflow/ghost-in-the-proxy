@@ -680,3 +680,49 @@ def test_stable_memory_survives_budget_jitter_and_nudges_fire_once():
     assert render(900, "anything").stable != first.stable
     # The nudge fired once; the same trigger next turn does not nag.
     assert "bring it up now" not in render(1600, "yes it's payday, I know").volatile
+
+
+def test_runtime_never_folds_on_the_request_path_in_a_steady_conversation(tmp_path, monkeypatch):
+    # Live (twice): the first fold came late, its memory section overflowed the
+    # window guard, and a second fold ran synchronously — 160-170 s turns. The
+    # assembler-level reserve was not enough: fold pressure is measured in the
+    # BACKGROUND pass, which has to reserve the memory budget too.
+    from server.mind.config import MindConfig
+    from server.mind.runtime import MindRuntime
+    from server.mind import runtime as runtime_module
+
+    class Provider:
+        name = "fake"
+
+        async def chat_completions(self, payload):
+            facts = [{"op": "add", "kind": "fact", "subject": f"s{i} {len(payload['messages'][-1]['content'])}",
+                      "claim": "detail " * 25, "core": i % 2 == 0} for i in range(6)]
+            return {"choices": [{"message": {"content": json.dumps({"ops": facts, "episode": "things happened. " * 6})}}]}
+
+    paths = []
+    original = runtime_module.MindRuntime._fold
+
+    async def spy(self, session_id, events, provider, model, upto, clock, path):
+        paths.append(path)
+        return await original(self, session_id, events, provider, model, upto, clock, path)
+
+    monkeypatch.setattr(runtime_module.MindRuntime, "_fold", spy)
+    runtime = MindRuntime(MindConfig(enabled=True, db_dir=str(tmp_path), mem_backend="lexical", window=8192))
+
+    async def go():
+        transcript = [message("system", "You are Sable.")]
+        worst = 0
+        for turn in range(45):
+            transcript.append(message("user", f"turn {turn}: " + "lorem ipsum dolor " * 25))
+            prepared = await runtime.prepare(transcript, Provider(), "m", now=1_800_000_000.0 + 60 * turn)
+            worst = max(worst, prepared.estimated_tokens)
+            reply = message("assistant", f"reply {turn}: " + "consectetur adipiscing " * 25)
+            runtime.observe_reply(prepared.session_id, reply)
+            transcript.append(reply)
+            await runtime.drain()
+        return worst
+
+    worst = asyncio.run(go())
+    assert paths and set(paths) == {"background"}
+    from server.mind.assembler import token_budgets
+    assert worst <= token_budgets(runtime.config)[0]

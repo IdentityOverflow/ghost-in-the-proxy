@@ -407,6 +407,7 @@ class MindRuntime:
         try:
             events = self.store.live_events(session_id)
             state = replay(self.store.live_folds(session_id))
+            scale = self._scale.get(context.model, DEFAULT_TOKEN_SCALE)
             workspace = assemble(
                 self.config,
                 self.store.get_client_system(session_id),
@@ -415,7 +416,12 @@ class MindRuntime:
                 memory_text=context.memory_text,
                 now=context.clock,
                 tools_tokens=context.tools_tokens,
-                scale=self._scale.get(context.model, DEFAULT_TOKEN_SCALE),
+                scale=scale,
+                # Same reserve as the request path — THIS is where fold
+                # pressure is measured, so this is where it has to count.
+                memory_budget_tokens=memory_budget(
+                    self.config, token_budgets(self.config, context.tools_tokens, scale)[0]
+                ),
             )
             scene = _Scene(session_id, workspace, state, None, 0)
             if self._uncovered_tokens(events, scene) > self.config.summary_trigger_tokens:
