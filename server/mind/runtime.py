@@ -27,6 +27,7 @@ from .config import MindConfig, mind_config
 from .dynamics import ThreadState, admitted_threads, cued_threads, update_dynamics
 from .perception import reconcile
 from .mem import MemQuery, create_mem_backend
+from .metrics import emit
 from .recall import RECALL_TOOL, resolve_recall
 from .router import scope_tools
 from .steward import run_steward
@@ -101,16 +102,35 @@ class MindRuntime:
             # structured ledger (steward), falling back to the v0 prose
             # summarizer if the steward's proposal doesn't parse.
             upto = self._fold_boundary(events, workspace.desired_from_seq - 1)
+            fold_started = time.monotonic()
+            before = self._ledger_keys(records)
+            fold_error = ""
             try:
                 await run_steward(
                     self.config, self.store, recon.session_id, events, provider, model, upto,
                     now=clock,
                 )
             except Exception as error:
+                fold_error = repr(error)[:300]
                 print(f"[mind] steward failed ({error!r}); prose fallback", flush=True)
                 await update_summary(
                     self.config, self.store, recon.session_id, events, provider, model, upto
                 )
+            after = self._ledger_keys(self.store.live_records(recon.session_id))
+            emit(
+                "fold",
+                session=recon.session_id,
+                upto_seq=upto,
+                ok=not fold_error,
+                error=fold_error,
+                seconds=round(time.monotonic() - fold_started, 2),
+                ledger_before=len(before),
+                ledger_after=len(after),
+                # Keys present before the fold and absent after: the
+                # telephone-game signal (renames count too — also a loss of
+                # identity for anything keyed on them).
+                lost_keys=sorted(before - after)[:40],
+            )
             summary = self.store.latest_summary(recon.session_id)
             records = self.store.live_records(recon.session_id)
             episodes = self.store.live_episodes(recon.session_id)
@@ -177,6 +197,22 @@ class MindRuntime:
                 }
             ),
             flush=True,
+        )
+        emit(
+            "request",
+            session=recon.session_id,
+            outcome=recon.outcome,
+            live_events=len(events),
+            workspace_tokens=workspace.estimated_tokens,
+            memory_tokens=workspace.memory_tokens,
+            system_tokens=workspace.system_tokens,
+            budget_tokens=workspace.budget_tokens,
+            texture_messages=len(workspace.messages) - (1 if workspace.system_tokens else 0),
+            texture_from_seq=workspace.texture_from_seq,
+            summary_upto=(summary or (0, ""))[0],
+            ledger={kind: len(items) for kind, items in records.items()},
+            episodes=len(episodes),
+            autocue=len(recalled or []),
         )
         return PreparedRequest(
             recon.session_id,
@@ -311,6 +347,15 @@ class MindRuntime:
         return ThreadsView(
             admitted=admitted, cued=cued, all_keys={state.key for state in states}
         )
+
+    @staticmethod
+    def _ledger_keys(records: dict[str, list[dict[str, Any]]]) -> set[str]:
+        """Identity keys of ledger entries, for fold-churn telemetry."""
+        keys: set[str] = set()
+        for kind, field in (("fact", "subject"), ("decision", "topic"), ("commitment", "statement")):
+            for item in records.get(kind, []):
+                keys.add(f"{kind}:{str(item.get(field, '')).strip().lower()}")
+        return keys
 
     def _fold_boundary(self, events, base_upto: int) -> int:
         """Extend the fold boundary past what the budget strictly requires.

@@ -202,6 +202,11 @@ class Workspace:
     texture_from_seq: int  # first live seq actually included verbatim
     desired_from_seq: int  # first seq the BUDGET wanted — eviction pressure
     estimated_tokens: int
+    # Telemetry split: the mind's own memory section vs the whole system
+    # message (client prompt + memory) vs the workspace budget it lives in.
+    memory_tokens: int = 0
+    system_tokens: int = 0
+    budget_tokens: int = 0
 
 
 def _texture_blocks(events: list[Event]) -> list[list[Event]]:
@@ -331,6 +336,9 @@ def assemble(
         desired_from_seq=desired_from_seq,
         estimated_tokens=system_cost
         + sum(estimate_tokens(render[event.seq]) for event in texture_events),
+        memory_tokens=estimate_tokens(memory) if memory else 0,
+        system_tokens=system_cost,
+        budget_tokens=workspace_budget,
     )
 
 
