@@ -507,12 +507,26 @@ class MindRuntime:
             MemQuery(text=last_user, trajectory=events[-8:], k=max(len(events), 4)),
             events,
         )
-        rescued = [
-            span
-            for span in spans
-            if span.seq <= folded_upto and span.sim >= self.config.embed_min_sim
-        ]
-        return rescued[:2] or None
+        folded = [span for span in spans if span.seq <= folded_upto and span.sim > 0]
+        if not folded:
+            return None
+        # The fixed cosine floor was calibrated on a 15-turn scenario; in a
+        # long conversation SOMETHING always clears it (the soak auto-cued on
+        # 133 of 160 turns). A span must also stand out from this query's own
+        # background: mean + 1.5 sd over the folded history.
+        sims = [span.sim for span in folded]
+        mean = sum(sims) / len(sims)
+        spread = (sum((sim - mean) ** 2 for sim in sims) / len(sims)) ** 0.5
+        floor = max(self.config.embed_min_sim, mean + 1.5 * spread)
+        # Rank by the SEMANTIC component (the hybrid score's lexical half
+        # favours long assistant replies sharing common words), and prefer
+        # what the user said: that is where one-off details live.
+        rescued = sorted(
+            (span for span in folded if span.sim >= floor),
+            key=lambda span: span.sim + (0.03 if span.role == "user" else 0.0),
+            reverse=True,
+        )
+        return rescued[:3] or None
 
     def _attention(
         self, session_id: str, events: list[Event], state: LedgerState

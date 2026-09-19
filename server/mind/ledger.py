@@ -133,7 +133,22 @@ def _clean(value: Any) -> Any:
     return value
 
 
+# The model knows a record's id, not reliably its kind: observed live, a
+# budget correction arrived as update(r6, claim=...) where r6 was a decision
+# (whose value field is "choice") — the op "changed nothing" and the
+# correction was lost. The value/key fields are aliases of one another.
+FIELD_ALIASES = {
+    "fact": {"choice": "claim", "statement": "claim", "topic": "subject"},
+    "decision": {"claim": "choice", "statement": "choice", "subject": "topic"},
+    "commitment": {"claim": "statement", "choice": "statement", "subject": "statement"},
+}
+
+
 def _record_fields(kind: str, op: dict[str, Any]) -> dict[str, Any]:
+    op = dict(op)
+    for alias, target in FIELD_ALIASES[kind].items():
+        if op.get(alias) is not None and op.get(target) is None:
+            op[target] = op[alias]
     data: dict[str, Any] = {}
     for name in ALLOWED_FIELDS[kind]:
         if name in op and op[name] is not None:

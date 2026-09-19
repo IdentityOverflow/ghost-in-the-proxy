@@ -220,6 +220,7 @@ FIXED.update(
             "I'm filling in the electrical plan. What battery capacity am I sizing "
             "everything for?",
             "correction-mid", 22, _mention("corrected capacity", r"280"),
+            _never("stale capacity as current", r"(is|for|around|at)\s+\*{0,2}(a\s+|the\s+)?200\s?ah"),
         ),
         72: _plant(
             "Heater verdict, final this time: diesel. I ordered the Autoterm 2D "
@@ -249,6 +250,9 @@ FIXED.update(
             "I'm doing the monthly money check. What's my budget ceiling for the "
             "whole build again?",
             "correction-mid", 47, _mention("corrected budget", r"14[,.\s]?500", r"14\.5"),
+            # Certified against a live false pass: "Your hard ceiling is
+            # **12,000 euros** (you mentioned 14,500 once...)".
+            _never("stale budget as current", r"(is|remains|still|of)\s+\*{0,2}€?\s?12[,.\s]?000"),
         ),
         99: _probe(
             99,
@@ -313,7 +317,13 @@ FIXED.update(
             130,
             "Ilse's asking for the date again. When are we setting off?",
             "correction-mid", 78, _mention("corrected date", r"3(rd)? (of )?july", r"july 3"),
-            _never("stale date as current", r"12(th)? (of )?june(?! (is|was) (dead|off|out|the (old|earlier)))"),
+            # Mentioning the old date AS old is correct ("the original 12 June
+            # date is dead"); presenting it as the plan is the failure.
+            _never(
+                "stale date as current",
+                r"(?<!original )(?<!earlier )(?<!old )12(th)?\s+(of\s+)?june"
+                r"(?![^.]{0,60}(dead|old|original|earlier|scrapped|no longer|was|moved|slid|instead))",
+            ),
         ),
         133: _plant(
             "Booked our first night: a campsite called Camping La Viorna, near Potes. "
