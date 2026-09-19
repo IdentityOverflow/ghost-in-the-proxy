@@ -35,10 +35,22 @@ DIGEST_NOTICE = (
 )
 
 
+class WorkspaceOverflow(Exception):
+    """The request cannot be made to fit the window by any safe eviction or
+    truncation (a huge client system prompt, giant tool-call arguments).
+    Surfaced to the client as a context-length error: silently sending it
+    would either fail at the backend or be truncated there — the
+    confabulation source the mind exists to remove."""
+
+
 def estimate_tokens(payload: Any) -> int:
-    if isinstance(payload, str):
-        return max(1, len(payload) // 4)
-    return max(1, len(json.dumps(payload, ensure_ascii=False)) // 4)
+    """Cheap token estimate. ~4 chars/token holds for English prose; text
+    outside ASCII (CJK, Cyrillic, emoji) runs far denser, up to a token per
+    character, so it is counted separately — a first request in Chinese must
+    not look four times smaller than it is. Calibration refines the rest."""
+    text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+    dense = sum(1 for char in text if ord(char) > 0x2FF)
+    return max(1, (len(text) - dense) // 4 + int(dense * 0.8))
 
 
 @dataclass
@@ -211,6 +223,15 @@ def assemble(
         if excess <= 0 or not texture_events:
             break
         _shrink_block(texture_events, render, excess)
+    final = system_cost + sum(estimate_tokens(render[e.seq]) for e in texture_events)
+    # Small slack: the guard works in estimates, and a few tokens over the
+    # (already conservative) hard limit is not worth failing a request for.
+    if final > hard_limit * 1.03:
+        raise WorkspaceOverflow(
+            f"request needs ~{final} tokens after eviction and truncation; "
+            f"the limit for a {config.window}-token window is ~{hard_limit} "
+            f"(system prompt {system_cost}, tools {tools_tokens})"
+        )
 
     messages: list[dict[str, Any]] = []
     if system_content:

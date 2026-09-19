@@ -52,10 +52,11 @@ Output:
 {"ops":[{"op":"update","id":"r4","claim":"4m x 5m (was 3m x 4m)","src":41},{"op":"thread","id":"n1","name":"brother-visit","kind":"aside","summary":"Priya's brother Anil visits in May.","anchors":["Anil","May","vegetarian"]},{"op":"add","kind":"fact","subject":"brother","claim":"Anil, visiting in May, vegetarian","thread":"n1","core":true,"src":41},{"op":"update","id":"r5","status":"decided","choice":"cedar","src":41},{"op":"close","id":"r6","status":"done"},{"op":"add","kind":"commitment","actor":"assistant","statement":"remind Priya to book the skip","trigger":"before demolition day","due":null,"src":41}],"episode":"Priya corrected the pond liner size to 4m x 5m and settled on a cedar fence. She mentioned her vegetarian brother Anil visits in May, confirmed the gravel is ordered, and asked to be reminded to book the skip before demolition day."}
 
 Rules:
+- The USER's statements are the evidence. Record what the user tells you about their world, plans and preferences. NEVER record the assistant's advice, how-to steps, checklists or explanations as facts (they belong in the episode narrative at most), and never turn an assistant's guess into a fact.
 - Entries you do not mention stay exactly as they are. Never re-add something already in memory; to change it, "update" it by id. An empty ops list is fine when nothing durable was said.
 - A correction is an "update" of the existing entry: put the new value in the claim and note the old one ("4m x 5m (was 3m x 4m)").
 - Subjects are specific: "battery capacity", "battery location" — not just "battery". One fact per claim.
-- Decisions belong to the USER. Record what the user settled or is leaning toward — NEVER the assistant's recommendations. "decided" only when the user explicitly settled it; if they say they are still thinking, it is "leaning" or "open". When a leaning becomes final, "update" its status to "decided". Do not record vague goals as decisions.
+- Decisions belong to the USER. Record what the user settled or is leaning toward — NEVER the assistant's recommendations. "decided" only when the user explicitly settled it ("decided", "final", "ordered it"); a question like "should I do X or Y?" is an OPEN decision even if the assistant recommended X; if they say they are still thinking, it is "leaning" or "open". When a leaning becomes final, "update" its status to "decided". Do not record vague goals as decisions.
 - Commitments are promises to act LATER or standing requests to track something ("remind me to X", "don't let me forget X", "before we leave, X"). Record them with their trigger. A request fulfilled in the same turn is NOT a commitment, and neither is the user's own to-do for today. When a commitment has been carried out or cancelled, "close" it.
 - When a trigger is a time ("in two hours", "tomorrow morning"), compute the absolute datetime from the timestamp of the message that set it and put it in "due"; event triggers get due: null.
 - "core": true for what the assistant must ALWAYS have at hand: the names of people, animals and named things, hard constraints, allergies and health needs, key dates and deadlines, budgets. Ordinary details are core: false.
@@ -143,6 +144,8 @@ async def run_steward(
     upto_seq: int,
     now: float | None = None,
     mem: MemBackend | None = None,
+    scale: float = 1.33,
+    on_usage: Any = None,
 ) -> FoldOutcome:
     """Fold live events up to upto_seq into the fold log.
 
@@ -155,10 +158,11 @@ async def run_steward(
     fold = [event for event in events if state.covered_upto < event.seq <= upto_seq]
     if not fold:
         return outcome
-    for chunk in _chunks(fold, config.steward_input_tokens):
+    for chunk in _chunks(fold, _transcript_cap(config, scale)):
         state = replay(store.live_folds(session_id))
         committed = await _fold_pass(
-            config, store, session_id, state, chunk, provider, model, now, mem, outcome
+            config, store, session_id, state, chunk, provider, model, now, mem, outcome,
+            scale, on_usage,
         )
         if not committed:
             outcome.stale = True
@@ -166,11 +170,30 @@ async def run_steward(
     return outcome
 
 
+def _output_reserve(config: MindConfig) -> int:
+    """Real tokens kept free for the steward's reply."""
+    return min(config.extraction_max_tokens, max(700, config.window // 5))
+
+
+def _slice_cap(config: MindConfig) -> int:
+    return min(config.steward_slice_tokens, max(200, int(config.window * 0.12)))
+
+
+def _transcript_cap(config: MindConfig, scale: float) -> int:
+    """Estimated tokens of transcript one pass may carry: whatever the window
+    leaves after the system prompt, the ledger slice and the reply. At 4096
+    the configured 2600 simply does not fit — the span is chunked smaller
+    instead of sending a call that can only truncate."""
+    usable = int((config.window - _output_reserve(config)) / scale)
+    room = usable - estimate_tokens(STEWARD_SYSTEM) - _slice_cap(config) - 120
+    return max(300, min(config.steward_input_tokens, room))
+
+
 def _chunks(fold: list[Event], cap_tokens: int) -> list[list[Event]]:
     chunks: list[list[Event]] = [[]]
     spent = 0
     for event in fold:
-        cost = estimate_tokens(_flatten(event.message))
+        cost = estimate_tokens(_flatten(event.message, cap_tokens))
         if chunks[-1] and spent + cost > cap_tokens:
             chunks.append([])
             spent = 0
@@ -213,7 +236,7 @@ async def build_slice(
     a correction can only be an update if the model can see what it corrects.
     """
     lines: list[str] = []
-    budget = config.steward_slice_tokens
+    budget = _slice_cap(config)
 
     def add(line: str, floor: int = 0) -> bool:
         """Append while the slice stays above `floor` tokens of headroom."""
@@ -227,7 +250,7 @@ async def build_slice(
 
     # Threads and pinned entries may use 60% of the slice between them; the
     # rest is kept for whatever the span is actually about.
-    floor = int(config.steward_slice_tokens * 0.4)
+    floor = int(budget * 0.4)
     threads = sorted(state.threads.values(), key=lambda t: t.updated_seq, reverse=True)
     for thread in threads[:SLICE_MAX_THREADS]:
         summary = str(thread.data.get("summary", ""))[:160]
@@ -265,11 +288,14 @@ async def _fold_pass(
     now: float | None,
     mem: MemBackend | None,
     outcome: FoldOutcome,
+    scale: float = 1.33,
+    on_usage: Any = None,
 ) -> bool:
     """One chunk -> one committed fold row. False = span went stale (fork)."""
     span_from, span_to = fold[0].seq, fold[-1].seq
     transcript = "\n".join(
-        f"[seq {event.seq} {event.role}{_stamp(event, now)}] {_flatten(event.message)}"
+        f"[seq {event.seq} {event.role}{_stamp(event, now)}] "
+        f"{_flatten(event.message, _transcript_cap(config, scale))}"
         for event in fold
     )
     ledger_slice = await build_slice(config, state, transcript, mem)
@@ -291,7 +317,9 @@ async def _fold_pass(
     episode = ""
     kind = "steward"
     try:
-        content = await _extract(config, provider, extraction_model, messages, schema=True)
+        content = await _extract(
+            config, provider, extraction_model, messages, schema=True, scale=scale, on_usage=on_usage
+        )
         ops, episode = _parse_proposal(content)
     except Exception as error:
         outcome.errors.append(repr(error)[:300])
@@ -307,13 +335,19 @@ async def _fold_pass(
                 {"role": "user", "content": transcript},
             ],
             schema=False,
+            scale=scale,
         )
         episode = _strip_think(episode).strip()
         if not episode:
             raise StewardParseError("episode fallback returned nothing")
 
+    if ops:
+        merged = await _merge_near_duplicates(config, state, ops, mem)
+        outcome.deduped += merged
     # Dry-run the ops on a scratch replay for the report; the fold row stores
-    # the RAW ops — replay revalidates them identically every time.
+    # the ops as proposed (after the semantic merge, which needs embeddings
+    # and therefore must happen exactly once, here) — replay revalidates them
+    # identically every time.
     report = apply_ops(state, ops, fold=len(state.episodes) + 1, span_to=span_to)
     seq = store.append_fold(session_id, span_from, span_to, ops, episode, kind=kind)
     if seq is None:
@@ -322,6 +356,45 @@ async def _fold_pass(
     outcome.prose_fallbacks += 1 if kind == "prose" else 0
     _merge_report(outcome, report)
     return True
+
+
+NEAR_DUPLICATE_SIM = 0.88
+
+
+async def _merge_near_duplicates(
+    config: MindConfig, state: LedgerState, ops: list[dict[str, Any]], mem: MemBackend | None
+) -> int:
+    """Turn an `add` that restates an existing entry into an `update` of it.
+
+    Key-equality de-dup (ledger.py) misses paraphrased keys — observed live:
+    "Teodor: mechanic who quoted 640 euros" then "timing chain quote: Teodor
+    quoted 640 euros" as two facts. With a semantic backend the restatement
+    is recognisable; without one this is a no-op. Rewrites ops in place.
+    """
+    if mem is None:
+        return 0
+    merged = 0
+    for op in ops:
+        if op.get("op") != "add" or op.get("kind") not in ("fact", "decision", "commitment"):
+            continue
+        existing = [r for r in state.by_kind(op["kind"]) if r.is_open]
+        if not existing:
+            continue
+        text = " ".join(
+            str(op.get(name, ""))
+            for name in ("subject", "topic", "statement", "claim", "choice", "trigger")
+            if op.get(name)
+        )
+        sims = await mem.text_sims(text, [record.text() for record in existing])
+        if not sims:
+            return merged  # no semantic signal available (lexical backend, outage)
+        best = max(range(len(existing)), key=lambda index: sims[index])
+        if sims[best] >= NEAR_DUPLICATE_SIM:
+            op["op"] = "update"
+            op["id"] = existing[best].id
+            op.pop("kind", None)
+            merged += 1
+    return merged
 
 
 def _merge_report(outcome: FoldOutcome, report: ApplyReport) -> None:
@@ -336,11 +409,11 @@ async def _extract(
     model: str,
     messages: list[dict[str, Any]],
     schema: bool,
+    scale: float = 1.33,
+    on_usage: Any = None,
 ) -> str:
     estimated_input = sum(estimate_tokens(m["content"]) for m in messages)
-    # chars/4 undercounts ~20%; leave the rest of the window for the output,
-    # never more than the configured cap.
-    room = config.window - int(estimated_input * 1.25) - 64
+    room = config.window - int(estimated_input * scale) - 64
     payload: dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -348,21 +421,45 @@ async def _extract(
         "stream": False,
         "max_tokens": max(256, min(config.extraction_max_tokens, room)),
     }
+
+    def finish(response: dict[str, Any]) -> str:
+        if on_usage is not None:
+            # Extraction calls are non-streaming and hit the same tokenizer as
+            # the conversation: free calibration even for stream-only clients.
+            on_usage(estimated_input, (response.get("usage") or {}).get("prompt_tokens"))
+        return response["choices"][0]["message"].get("content") or ""
+
     refusal_key = f"{getattr(provider, 'name', '')}:{model}"
     if schema and config.steward_json_schema and refusal_key not in _SCHEMA_REFUSED:
         try:
-            response = await provider.chat_completions(
-                {**payload, "response_format": {"type": "json_schema", "json_schema": OP_SCHEMA}}
+            return finish(
+                await provider.chat_completions(
+                    {**payload, "response_format": {"type": "json_schema", "json_schema": OP_SCHEMA}}
+                )
             )
-            return response["choices"][0]["message"].get("content") or ""
         except Exception as error:
-            status = getattr(getattr(error, "response", None), "status_code", None)
-            if status not in (400, 404, 422, 501):
+            if not _is_schema_refusal(error):
                 raise
             _SCHEMA_REFUSED.add(refusal_key)
-            print(f"[mind] backend refused json_schema ({status}); plain JSON from now on", flush=True)
-    response = await provider.chat_completions(payload)
-    return response["choices"][0]["message"].get("content") or ""
+            print("[mind] backend refused json_schema; plain JSON from now on", flush=True)
+    return finish(await provider.chat_completions(payload))
+
+
+def _is_schema_refusal(error: Exception) -> bool:
+    """A 4xx that is ABOUT response_format — not a context-length 400, which
+    would otherwise switch constrained decoding off for good."""
+    response = getattr(error, "response", None)
+    if getattr(response, "status_code", None) not in (400, 404, 415, 422, 501):
+        return False
+    try:
+        body = response.text.lower()
+    except Exception:
+        return True
+    if any(word in body for word in ("context", "too long", "maximum", "exceed")):
+        return False
+    return not body or any(
+        word in body for word in ("response_format", "json_schema", "schema", "unsupported", "not support", "grammar")
+    )
 
 
 def _strip_think(content: str) -> str:
@@ -405,7 +502,7 @@ def _stamp(event: Event, now: float | None) -> str:
     return " " + datetime.fromtimestamp(event.ts).isoformat(timespec="minutes")
 
 
-def _flatten(message: dict[str, Any]) -> str:
+def _flatten(message: dict[str, Any], chunk_cap_tokens: int = MESSAGE_TOKEN_CAP) -> str:
     parts = []
     content = content_text(message)
     if content:
@@ -414,9 +511,14 @@ def _flatten(message: dict[str, Any]) -> str:
         function = call.get("function", {})
         parts.append(f"(called tool {function.get('name')} with {function.get('arguments')})")
     text = " ".join(parts)
-    if estimate_tokens(text) < MESSAGE_TOKEN_CAP:
+    # One message may never exceed what a whole pass can carry (at a 4k
+    # window that is far below the default per-message cap).
+    cap = max(120, min(MESSAGE_TOKEN_CAP, chunk_cap_tokens - 40))
+    if estimate_tokens(text) < cap:
         return text
     # Head AND tail: conclusions live at the end of long messages, and the
-    # v1 head-only cut lost them before extraction ever saw them.
-    head, tail = MESSAGE_TOKEN_CAP * 4 * 2 // 3, MESSAGE_TOKEN_CAP * 4 // 3
+    # v1 head-only cut lost them before extraction ever saw them. Dense
+    # scripts cost ~a token per character, so cut by the measured ratio.
+    chars = int(len(text) * cap / estimate_tokens(text))
+    head, tail = chars * 2 // 3, chars // 3
     return f"{text[:head]} …[{len(text) - head - tail} chars omitted]… {text[-tail:]}"

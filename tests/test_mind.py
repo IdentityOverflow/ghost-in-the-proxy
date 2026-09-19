@@ -228,7 +228,7 @@ def test_mem_boundary_fires_on_fold(store, tmp_path, monkeypatch):
     runtime = MindRuntime(cfg)
     runtime.mem = _RecordingMem()
 
-    async def fake_steward(config, store_, session_id, events, provider, model, upto, now=None, mem=None):
+    async def fake_steward(config, store_, session_id, events, provider, model, upto, now=None, mem=None, **_):
         from server.mind.steward import FoldOutcome
 
         store_.append_fold(session_id, events[0].seq, upto, [], "condensed")

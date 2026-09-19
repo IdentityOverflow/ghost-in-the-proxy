@@ -81,7 +81,8 @@ class _Item:
 
 
 def estimate_tokens(text: str) -> int:
-    return max(1, len(text) // 4)
+    dense = sum(1 for char in text if ord(char) > 0x2FF)
+    return max(1, (len(text) - dense) // 4 + int(dense * 0.8))
 
 
 def format_clock(ts: float) -> str:
@@ -263,10 +264,12 @@ async def render_memory(
         nonlocal remaining
         left: list[_Item] = []
         spent = 0
-        for position, item in enumerate(items):
+        for item in items:
             if spent + item.cost > cap or item.cost > remaining:
-                left = items[position:]
-                break
+                # Skip, don't stop: one oversized entry must not block every
+                # shorter one queued behind it.
+                left.append(item)
+                continue
             chosen[name].append(item)
             spent += item.cost
             remaining -= item.cost
@@ -333,6 +336,11 @@ def _render_sections(
     sections: list[str] = []
     if now_section:
         sections.append(now_section)
+    if not chosen["commitments"] and total_open_commitments:
+        sections.append(
+            f"### Open commitments\n- ({total_open_commitments} tracked items exist but are not "
+            "shown here — if asked what is outstanding, say you need to look them up)"
+        )
     if chosen["commitments"]:
         hidden = len(overflow["commitments"])
         title = (

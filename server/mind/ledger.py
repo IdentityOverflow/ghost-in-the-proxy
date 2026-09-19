@@ -32,6 +32,9 @@ DECISION_STATUSES = ("decided", "leaning", "open")
 COMMITMENT_STATUSES = ("open", "done", "dropped")
 THREAD_FIELDS = ("name", "kind", "summary", "anchors", "open_questions")
 FIELD_CHAR_CAP = 400
+# Fields an update may CLEAR with an explicit null ("only when I ask"
+# replacing "tomorrow" must be able to drop the deadline).
+NULLABLE_FIELDS = ("due", "trigger", "reason")
 
 
 @dataclass
@@ -117,7 +120,9 @@ class ApplyReport:
 
 
 def normalize_key(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+    # Unicode-aware: an ASCII-only filter maps every non-English key to ""
+    # and de-duplication then merges unrelated records into one.
+    return re.sub(r"[\W_]+", " ", text.lower()).strip()
 
 
 def _clean(value: Any) -> Any:
@@ -200,6 +205,10 @@ def apply_ops(
             if existing:
                 state.threads[existing].data.update(fields)
                 state.threads[existing].updated_seq = span_to
+                if ref:
+                    # The model re-declared a thread that already exists:
+                    # records citing its local handle still belong to it.
+                    handles[ref] = existing
             else:
                 if not fields.get("name") and not fields.get("summary"):
                     report.dropped.append(f"thread without name/summary: {ref}")
@@ -239,7 +248,7 @@ def apply_ops(
                 (
                     record
                     for record in state.records.values()
-                    if record.kind == kind and record.key == key and record.is_open
+                    if key and record.kind == kind and record.key == key and record.is_open
                 ),
                 None,
             )
@@ -282,10 +291,17 @@ def apply_ops(
                     data["thread"] = thread
                 else:
                     data.pop("thread")
-            if not data:
+            cleared = [
+                name for name in NULLABLE_FIELDS
+                if name in op and op[name] is None and name in record.data
+                and name in ALLOWED_FIELDS[record.kind]
+            ]
+            if not data and not cleared:
                 report.dropped.append(f"{verb} {record.id} changed nothing")
                 continue
             record.data.update(data)
+            for name in cleared:
+                record.data.pop(name)
             record.updated_fold, record.updated_seq = fold, span_to
             record.src = _src(op) or record.src
             report.applied += 1

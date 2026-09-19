@@ -49,11 +49,12 @@ async def consolidate_once(
         group = aged[:size]
         text = await _condense(config, provider, model, [episode.text for episode in group])
         if text:
-            store.append_consolidation(
+            committed = store.append_consolidation(
                 session_id, 1, group[0].fold, group[-1].fold,
                 group[0].span_from, group[-1].span_to, text,
+                expected_children=len(group),
             )
-            return 1
+            return 1 if committed else None
         return None
 
     epochs = [c for c in consolidations if c["level"] == 2]
@@ -63,11 +64,12 @@ async def consolidate_once(
         group = aged_eras[:size]
         text = await _condense(config, provider, model, [c["content"] for c in group])
         if text:
-            store.append_consolidation(
+            committed = store.append_consolidation(
                 session_id, 2, group[0]["seq"], group[-1]["seq"],
                 group[0]["span_from"], group[-1]["span_to"], text,
+                expected_children=len(group),
             )
-            return 2
+            return 2 if committed else None
     return None
 
 

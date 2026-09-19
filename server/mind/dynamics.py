@@ -31,7 +31,8 @@ STOPWORDS = frozenset(
     would""".split()
 )
 
-_WORD = re.compile(r"[a-zA-Z][a-zA-Z0-9_-]+")
+# Unicode letters: lexical relevance must not be English-only.
+_WORD = re.compile(r"[^\W\d_][\w-]*")
 
 
 def tokenize(text: str) -> set[str]:
@@ -43,7 +44,9 @@ def tokenize(text: str) -> set[str]:
     tokens = set()
     for word in _WORD.findall(text.lower().replace("'", " ")):
         word = word.strip("-")
-        if word in STOPWORDS or len(word) < 3:
+        # Scripts without spaces/with dense words (CJK names are two
+        # characters) would all fall under an ASCII-sized length floor.
+        if word in STOPWORDS or len(word) < (3 if word.isascii() else 2):
             continue
         if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
             word = word[:-1]

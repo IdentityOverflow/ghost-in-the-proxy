@@ -11,6 +11,7 @@ from ..schemas import ChatCompletionRequest
 from ..routing.router import resolve_provider_and_model
 from ..agent.graph import agent_graph
 from ..mind import get_mind_runtime
+from ..mind.assembler import WorkspaceOverflow
 from ..mind.config import mind_config
 
 
@@ -35,6 +36,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     session_id: str | None = None
     recall_offered = False
     estimated_tokens = 0
+    recall_budget = 0
     # Fake clock (v4 eval harness): trusted only when explicitly enabled,
     # otherwise clients could spoof the mind's sense of time.
     clock: float | None = None
@@ -54,15 +56,31 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             session_id = prepared.session_id
             recall_offered = prepared.recall_offered
             estimated_tokens = prepared.estimated_tokens
+            recall_budget = prepared.recall_budget_chars
             if prepared.tools_scoped:
                 tools_out = prepared.tools or []
                 if tools_out:
                     payload["tools"] = tools_out
                 else:
                     payload.pop("tools", None)
+        except WorkspaceOverflow as error:
+            # Not a mind failure: the request genuinely cannot fit. Say so in
+            # the shape clients already handle, in either fail mode — passing
+            # the raw transcript through would fail at the backend anyway, or
+            # worse, be silently truncated there.
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": f"This request exceeds the model's context window: {error}",
+                        "type": "invalid_request_error",
+                        "code": "context_length_exceeded",
+                    }
+                },
+            )
         except Exception as error:
             if mind_config.fail_mode == "strict":
-                raise HTTPException(500, f"mind failure (strict mode): {error}") from error
+                raise HTTPException(500, f"mind failure (strict mode): {error!r}") from error
             print(f"[mind] ERROR, falling back to passthrough: {error!r}", flush=True)
 
     payload["messages"] = outgoing_messages
@@ -129,7 +147,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     else:
                         complete = True
                     if hops == 0 and mind is not None and session_id is not None:
-                        mind.note_usage(session_id, estimated_tokens, collector.prompt_tokens)
+                        mind.note_usage(req.model, estimated_tokens, collector.prompt_tokens)
                     if not complete or held is None:
                         break  # disconnect, or a fully-forwarded stream
                     # Stream ended while held: pure-recall reply (or nothing).
@@ -144,9 +162,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         for call in calls:
                             content = await _recall(
                                 mind, session_id, call.get("function", {}).get("arguments") or "{}",
-                                recall_chars,
+                                recall_budget - recall_chars,
                             )
-                            recall_chars += len(content)
+                            recall_chars += len(content) + RECALL_HOP_OVERHEAD_CHARS
                             followup.append(
                                 {
                                     "role": "tool",
@@ -184,7 +202,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         resp = await provider.chat_completions(payload)
         if mind is not None and session_id is not None:
             mind.note_usage(
-                session_id, estimated_tokens, (resp.get("usage") or {}).get("prompt_tokens")
+                req.model, estimated_tokens, (resp.get("usage") or {}).get("prompt_tokens")
             )
         # Recall interception (v3): recall is OUR tool, invisible to the
         # client. Resolve it proxy-side and re-query; the exchange never
@@ -210,9 +228,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             for call in recall_calls:
                 content = await _recall(
                     mind, session_id, call.get("function", {}).get("arguments") or "{}",
-                    recall_chars,
+                    recall_budget - recall_chars,
                 )
-                recall_chars += len(content)
+                recall_chars += len(content) + RECALL_HOP_OVERHEAD_CHARS
                 followup.append(
                     {
                         "role": "tool",
@@ -237,13 +255,19 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     return JSONResponse(resp)
 
 
-async def _recall(mind, session_id: str, arguments: str, spent_chars: int) -> str:
-    """Resolve one recall call under the request-wide recall budget: hops pile
-    on top of an already-assembled workspace, and unbounded they overflow a
-    small window on their own."""
-    if spent_chars >= 2 * mind.recall_char_budget():
-        return "recall: the memory budget for this reply is used up — answer from what you already have."
-    return await mind.resolve_recall(session_id, arguments)
+# The recall exchange itself costs context beyond its payload: the assistant
+# tool-call message, the tool-result wrapper, chat-template framing.
+RECALL_HOP_OVERHEAD_CHARS = 320
+
+
+async def _recall(mind, session_id: str, arguments: str, chars_left: int) -> str:
+    """Resolve one recall call within what the ASSEMBLED request can still
+    absorb: hops pile on top of the workspace, and budgeted per hop alone they
+    overflow a small window before the model gets to answer."""
+    usable = chars_left - RECALL_HOP_OVERHEAD_CHARS
+    if usable < 300:
+        return "recall: no room left in context for more memory — answer from what you already have."
+    return await mind.resolve_recall(session_id, arguments, char_budget=usable)
 
 
 class _DeltaCollector:

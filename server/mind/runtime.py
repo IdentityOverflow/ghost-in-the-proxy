@@ -34,7 +34,7 @@ from .ledger import LedgerState, replay
 from .mem import MemQuery, create_mem_backend
 from .memory_view import ThreadsView, memory_budget, render_memory
 from .metrics import emit
-from .perception import reconcile
+from .perception import reconcile, resolve_session
 from .recall import RECALL_TOOL, resolve_recall
 from .router import scope_tools
 from .steward import FoldOutcome, run_steward
@@ -56,6 +56,9 @@ class PreparedRequest:
     # What the mind estimated for the whole request (workspace + tool
     # schemas) — paired with the backend's usage to calibrate the estimate.
     estimated_tokens: int = 0
+    # Characters of recall payload the request can still absorb, across all
+    # hops, before the follow-up would overflow the window.
+    recall_budget_chars: int = 0
 
 
 @dataclass
@@ -94,6 +97,7 @@ class MindRuntime:
         self._context: dict[str, _SessionContext] = {}
         self._background: set[asyncio.Task] = set()
         # Real tokens per estimated token, learned from usage.prompt_tokens.
+        # Keyed by MODEL: it is a property of the tokenizer, not the session.
         self._scale: dict[str, float] = {}
 
     def _lock(self, session_id: str) -> asyncio.Lock:
@@ -111,52 +115,85 @@ class MindRuntime:
     ) -> PreparedRequest:
         """`now` is a client-supplied clock (X-Mind-Clock, fake-clock eval runs
         only); None means the real wall clock."""
-        recon = reconcile(self.store, messages, now=now)
-        session_id = recon.session_id
         # Chronos (v4): the time the mind renders and reasons with. None keeps
         # every time-aware surface inert.
         clock = (now if now is not None else time.time()) if self.config.time_enabled else None
+        # Lock FIRST, reconcile under it: reconciliation mutates the store,
+        # and a request that mutates and then queues behind maintenance can
+        # wake up to another request's events.
         waited = time.monotonic()
-        async with self._lock(session_id):
+        held = self._lock(resolve_session(self.store, messages) or "__new__")
+        await held.acquire()
+        try:
             waited = time.monotonic() - waited
-            events = self.store.live_events(session_id)
-            seen = self._mem_seen.get(session_id, 0)
-            for event in events:
-                if event.seq > seen:
-                    await self.mem.observe(session_id, event)
-            if events:
-                self._mem_seen[session_id] = events[-1].seq
+            recon = reconcile(self.store, messages, now=now)
+            session_id = recon.session_id
+            own = self._lock(session_id)
+            if own is not held:
+                # New session (or the match changed while we queued). A fresh
+                # lock acquires without suspending, so nothing can slip in.
+                if own.locked():
+                    held.release()
+                    held = None
+                    await own.acquire()
+                    held = own
+                else:
+                    await own.acquire()
+                    held.release()
+                    held = own
+            return await self._prepare_locked(recon, provider, model, tools, clock, waited)
+        finally:
+            if held is not None:
+                held.release()
 
-            # v3 routing first: tool schemas ride in the same request, so
-            # their cost has to be known before the workspace is budgeted.
-            last_user_text = _last_user_text(events)
-            scoped = tools
-            tools_scoped = False
-            if self.config.tool_router_enabled and tools:
-                scoped = scope_tools(tools, events, last_user_text)
-                tools_scoped = scoped is not tools
-            out_tools = list(scoped) if scoped else []
+    async def _prepare_locked(
+        self,
+        recon: Any,
+        provider: Any,
+        model: str,
+        tools: list[dict[str, Any]] | None,
+        clock: float | None,
+        waited: float,
+    ) -> PreparedRequest:
+        session_id = recon.session_id
+        events = self.store.live_events(session_id)
+        seen = self._mem_seen.get(session_id, 0)
+        for event in events:
+            if event.seq > seen:
+                await self.mem.observe(session_id, event)
+        if events:
+            self._mem_seen[session_id] = events[-1].seq
 
-            scene = await self._scene(session_id, events, clock, out_tools)
-            folded = False
-            if self._must_fold_now(events, scene):
-                # Truth is about to leave view with nothing covering it (first
-                # contact with a long transcript, a restart, folding fell
-                # behind): bounded synchronous catch-up, then rebuild.
-                upto = self._fold_boundary(events, scene.workspace.desired_from_seq - 1)
-                await self._fold(session_id, events, provider, model, upto, clock, "request")
-                scene = await self._scene(session_id, events, clock, out_tools)
-                folded = True
+        # v3 routing first: tool schemas ride in the same request, so
+        # their cost has to be known before the workspace is budgeted.
+        last_user_text = _last_user_text(events)
+        scoped = tools
+        tools_scoped = False
+        if self.config.tool_router_enabled and tools:
+            scoped = scope_tools(tools, events, last_user_text)
+            tools_scoped = scoped is not tools
+        out_tools = list(scoped) if scoped else []
 
-            # Offer recall once anything has folded out of verbatim view.
-            recall_offered = self.config.recall_enabled and scene.state.covered_upto > 0
-            if recall_offered:
-                out_tools = out_tools + [RECALL_TOOL]
-                tools_scoped = True
-            tools_tokens = estimate_tokens(out_tools) if out_tools else 0
-            self._context[session_id] = _SessionContext(
-                provider, model, clock, tools_tokens, _memory_text(scene.workspace)
-            )
+        scene = await self._scene(session_id, events, clock, out_tools, model)
+        folded = False
+        if self._must_fold_now(events, scene):
+            # Truth is about to leave view with nothing covering it (first
+            # contact with a long transcript, a restart, folding fell
+            # behind): bounded synchronous catch-up, then rebuild.
+            upto = self._fold_boundary(events, scene.workspace.desired_from_seq - 1)
+            await self._fold(session_id, events, provider, model, upto, clock, "request")
+            scene = await self._scene(session_id, events, clock, out_tools, model)
+            folded = True
+
+        # Offer recall once anything has folded out of verbatim view.
+        recall_offered = self.config.recall_enabled and scene.state.covered_upto > 0
+        if recall_offered:
+            out_tools = out_tools + [RECALL_TOOL]
+            tools_scoped = True
+        tools_tokens = estimate_tokens(out_tools) if out_tools else 0
+        self._context[session_id] = _SessionContext(
+            provider, model, clock, tools_tokens, _memory_text(scene.workspace)
+        )
 
         workspace, state, threads = scene.workspace, scene.state, scene.threads
         ledger_counts = {kind: len(items) for kind, items in state.grouped().items()}
@@ -202,7 +239,7 @@ class MindRuntime:
             system_tokens=workspace.system_tokens,
             budget_tokens=workspace.budget_tokens,
             tools_tokens=tools_tokens,
-            token_scale=round(self._scale.get(session_id, DEFAULT_TOKEN_SCALE), 3),
+            token_scale=round(self._scale.get(model, DEFAULT_TOKEN_SCALE), 3),
             texture_messages=len(workspace.messages) - (1 if workspace.system_tokens else 0),
             texture_from_seq=workspace.texture_from_seq,
             summary_upto=state.covered_upto,
@@ -222,6 +259,9 @@ class MindRuntime:
             tools_scoped=tools_scoped,
             recall_offered=recall_offered,
             estimated_tokens=workspace.estimated_tokens + tools_tokens,
+            recall_budget_chars=self._recall_headroom(
+                workspace.estimated_tokens + tools_tokens, model
+            ),
         )
 
     async def _scene(
@@ -230,6 +270,7 @@ class MindRuntime:
         events: list[Event],
         clock: float | None,
         out_tools: list[dict[str, Any]],
+        model: str = "",
     ) -> _Scene:
         """Everything the model will see, built from current store state."""
         state = replay(self.store.live_folds(session_id))
@@ -238,7 +279,7 @@ class MindRuntime:
         recalled = await self._autocue(session_id, events, state.covered_upto)
         # +1 tool: recall joins the belt once anything is folded.
         tools_tokens = estimate_tokens(out_tools + [RECALL_TOOL]) if (out_tools or state.covered_upto) else 0
-        scale = self._scale.get(session_id, DEFAULT_TOKEN_SCALE)
+        scale = self._scale.get(model, DEFAULT_TOKEN_SCALE)
         budget, _hard = token_budgets(self.config, tools_tokens, scale)
         memory_text = await render_memory(
             self.config,
@@ -300,7 +341,7 @@ class MindRuntime:
                     memory_text=context.memory_text,
                     now=context.clock,
                     tools_tokens=context.tools_tokens,
-                    scale=self._scale.get(session_id, DEFAULT_TOKEN_SCALE),
+                    scale=self._scale.get(context.model, DEFAULT_TOKEN_SCALE),
                 )
                 scene = _Scene(workspace, state, None, 0)
                 if self._uncovered_tokens(events, scene) > self.config.summary_trigger_tokens:
@@ -347,6 +388,8 @@ class MindRuntime:
             outcome = await run_steward(
                 self.config, self.store, session_id, events, provider, model, upto,
                 now=clock, mem=self.mem,
+                scale=self._scale.get(model, DEFAULT_TOKEN_SCALE),
+                on_usage=lambda estimated, actual: self.note_usage(model, estimated, actual),
             )
         except Exception as error:
             error_text = repr(error)[:300]
@@ -398,20 +441,32 @@ class MindRuntime:
         )
         self.schedule_maintenance(session_id)
 
-    def note_usage(self, session_id: str, estimated_tokens: int, prompt_tokens: int | None) -> None:
+    def note_usage(self, model: str, estimated_tokens: int, prompt_tokens: int | None) -> None:
         """Calibrate the token estimate from what the backend actually counted.
         chars/4 is wrong by a model- and language-dependent factor; the
-        backend knows the truth, so learn it (EMA, clamped to sane bounds)."""
+        backend knows the truth, so learn it per model (EMA)."""
         if not prompt_tokens or estimated_tokens < 200:
             return
-        observed = max(1.0, min(prompt_tokens / estimated_tokens, 3.0))
-        previous = self._scale.get(session_id, DEFAULT_TOKEN_SCALE)
+        # No upper clamp worth the name: a measured density is a fact, and
+        # clamping below it guarantees overflow (code or CJK can run 4-5x).
+        observed = max(0.8, min(prompt_tokens / estimated_tokens, 8.0))
+        previous = self._scale.get(model, DEFAULT_TOKEN_SCALE)
         # Err high: undercounting overflows the window, overcounting only
         # wastes a little of it.
         blended = 0.7 * previous + 0.3 * observed
-        self._scale[session_id] = max(blended, observed * 0.97)
+        self._scale[model] = max(blended, observed * 0.97)
 
-    async def resolve_recall(self, session_id: str, arguments_json: str) -> str:
+    def _recall_headroom(self, estimated_tokens: int, model: str) -> int:
+        """Characters of recall payload this request can absorb in total."""
+        scale = self._scale.get(model, DEFAULT_TOKEN_SCALE)
+        reserve = max(int(self.config.window * self.config.reserve_fraction), 1024)
+        # Keep at least a third of the reply reserve for the actual answer.
+        headroom_real = self.config.window - reserve // 3 - int(estimated_tokens * scale)
+        return max(0, int(headroom_real / scale) * 4)
+
+    async def resolve_recall(
+        self, session_id: str, arguments_json: str, char_budget: int | None = None
+    ) -> str:
         events = self.store.live_events(session_id)
         # The trajectory stub: recent verbatim context as the episodic cue
         # (single moments are ambiguous — holographic experiment #5).
@@ -421,7 +476,9 @@ class MindRuntime:
             backend=self.mem,
             session_id=session_id,
             trajectory=events[-8:],
-            char_budget=self.recall_char_budget(),
+            char_budget=min(self.recall_char_budget(), char_budget)
+            if char_budget is not None
+            else self.recall_char_budget(),
         )
 
     def recall_char_budget(self) -> int:

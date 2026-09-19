@@ -142,21 +142,38 @@ class MindStore:
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(SCHEMA)
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(sessions)")}
+        if "anchor" not in columns:
+            # Session-resolution index (hash of the opening message); legacy
+            # rows keep NULL and are still scanned.
+            self._conn.execute("ALTER TABLE sessions ADD COLUMN anchor TEXT")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS sessions_anchor ON sessions (anchor)")
         self._lock = threading.Lock()
 
     # -- sessions -----------------------------------------------------------
 
-    def create_session(self, client_system: str | None) -> str:
+    def create_session(self, client_system: str | None, anchor: str | None = None) -> str:
         session_id = uuid.uuid4().hex[:12]
         with self._lock, self._conn:
             self._conn.execute(
-                "INSERT INTO sessions (id, client_system) VALUES (?, ?)",
-                (session_id, client_system),
+                "INSERT INTO sessions (id, client_system, anchor) VALUES (?, ?, ?)",
+                (session_id, client_system, anchor),
             )
         return session_id
 
-    def list_session_ids(self) -> list[str]:
-        rows = self._conn.execute("SELECT id FROM sessions ORDER BY created_ts").fetchall()
+    def list_session_ids(self, anchor: str | None = None) -> list[str]:
+        """All sessions, or — given an anchor — only those that could match a
+        transcript opening with that message (plus un-anchored legacy rows).
+        A session can only ever match a transcript sharing its first message,
+        so the filter is lossless, and it keeps resolution from loading every
+        event of every conversation the mind has ever had on each request."""
+        if anchor is None:
+            rows = self._conn.execute("SELECT id FROM sessions ORDER BY created_ts").fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT id FROM sessions WHERE anchor = ? OR anchor IS NULL ORDER BY created_ts",
+                (anchor,),
+            ).fetchall()
         return [row[0] for row in rows]
 
     def set_client_system(self, session_id: str, client_system: str | None) -> None:
@@ -395,8 +412,20 @@ class MindStore:
         span_from: int,
         span_to: int,
         content: str,
-    ) -> None:
+        expected_children: int = 0,
+    ) -> bool:
+        """Commit a consolidation — unless a fork invalidated any of the rows
+        it summarizes while the model was writing (the summary would
+        resurrect a discarded branch and hide surviving leaves behind it)."""
+        table = "folds" if level == 1 else "consolidations"
         with self._lock, self._conn:
+            live = self._conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE session = ? AND seq BETWEEN ? AND ?"
+                " AND superseded = 0" + ("" if level == 1 else " AND level = ?"),
+                (session_id, child_from, child_to) + (() if level == 1 else (level - 1,)),
+            ).fetchone()[0]
+            if expected_children and live < expected_children:
+                return False
             row = self._conn.execute(
                 "SELECT COALESCE(MAX(seq), 0) FROM consolidations WHERE session = ?",
                 (session_id,),
@@ -406,6 +435,7 @@ class MindStore:
                 " span_from, span_to, content) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (session_id, row[0] + 1, level, child_from, child_to, span_from, span_to, content),
             )
+        return True
 
     # -- thread dynamics (v2 CRS) ---------------------------------------------
 
