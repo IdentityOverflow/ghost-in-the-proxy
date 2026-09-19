@@ -550,7 +550,7 @@ def test_render_memory_sections():
     assert "sync: LEANING (not yet decided) — Turnstile (reason: simple)" in text
     assert "rotate token — trigger: deployment" in text
     assert "old thing" not in text  # done commitments stay out of the open list
-    assert "port: 9090 (was 8080)" in text
+    assert "port: 9090 [outdated earlier value: 8080 — do not use]" in text
     assert "planned the app" in text
     # Empty memory renders nothing.
     assert asyncio.run(render_memory(config(), LedgerState(), [], None, "", None, 4000)) == ""
