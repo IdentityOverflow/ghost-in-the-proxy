@@ -47,6 +47,13 @@ HYPE = re.compile(
 )
 MARKDOWN = re.compile(r"\*\*[^*]+\*\*|^\s*([-*•]|\d+\.)\s+\S|^#{1,4}\s", flags=re.MULTILINE)
 QUOTED = re.compile(r"[\"“']([^\"”']{6,60})[\"”']")
+SCARE_QUOTES = re.compile(r"(?<![\w])[\"“]([^\"”\n]{2,40})[\"”](?![\w])")
+SIGN_OFFS = re.compile(
+    r"(you('ve| have) got this|go (crush|get) (it|'em|some (sleep|rest))|you('ve| have) earned (it|this)|"
+    r"you should be proud|i('m| am) (here|around) (whenever|if)|i'll be here|good ?night,? \w+|"
+    r"you deserve (it|this))[.!]*\s*$",
+    flags=re.IGNORECASE,
+)
 
 
 def load(session: str) -> dict:
@@ -97,6 +104,8 @@ def tells(session: str, limit: int | None = None) -> dict:
         "markdown": sum(bool(MARKDOWN.search(r)) for r in replies) / len(pairs),
         "cheerleading": sum(len(HYPE.findall(r)) for r in replies) / len(pairs),
         "quotes_user_back": echo / len(pairs),
+        "scare_quotes": sum(bool(SCARE_QUOTES.search(r)) for r in replies) / len(pairs),
+        "pep_sign_off": sum(bool(SIGN_OFFS.search(r.strip())) for r in replies) / len(pairs),
         "mean_words": statistics.mean(lengths),
         "length_variation": statistics.pstdev(lengths) / max(1.0, statistics.mean(lengths)),
         "words_after_short_user_turn": (
@@ -117,6 +126,8 @@ def print_tells(sessions: list[str], limit: int | None) -> None:
         ("markdown", "bold / lists in chat", "{:.0%}"),
         ("cheerleading", "hype words per reply", "{:.1f}"),
         ("quotes_user_back", "quotes the user back", "{:.0%}"),
+        ("scare_quotes", "phrases in scare quotes", "{:.0%}"),
+        ("pep_sign_off", "pep-talk sign-offs", "{:.0%}"),
         ("mean_words", "mean reply length (words)", "{:.0f}"),
         ("words_after_short_user_turn", "  …after a <=12-word user turn", "{:.0f}"),
         ("length_variation", "length variation (sd/mean)", "{:.2f}"),

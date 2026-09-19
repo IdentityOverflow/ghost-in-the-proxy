@@ -68,6 +68,16 @@ HYPE = re.compile(
 )
 MARKDOWN = re.compile(r"\*\*[^*]+\*\*|^\s*([-*•]|\d+\.)\s+\S|^#{1,4}\s", flags=re.MULTILINE)
 QUOTED = re.compile(r"[\"“']([^\"”']{6,60})[\"”']")
+# Scare quotes: a short phrase in double quotes mid-sentence ('that "pre-work"
+# exhaustion'). The most persistent tell in a live 40-turn chat (15+ turns) —
+# and mostly NOT a literal echo of the user, so the echo check never saw it.
+SCARE_QUOTES = re.compile(r"(?<![\w])[\"“]([^\"”\n]{2,40})[\"”](?![\w])")
+SIGN_OFFS = re.compile(
+    r"(you('ve| have) got this|go (crush|get) (it|'em|some (sleep|rest))|you('ve| have) earned (it|this)|"
+    r"you should be proud|i('m| am) (here|around) (whenever|if)|i'll be here|good ?night,? \w+|"
+    r"you deserve (it|this))[.!]*\s*$",
+    flags=re.IGNORECASE,
+)
 
 
 def _words(text: str) -> int:
@@ -111,13 +121,21 @@ def observe(user_turns: list[str], replies: list[str]) -> list[str]:
         )
     if sum(bool(MARKDOWN.search(reply)) for reply in window) >= 2 and not MARKDOWN.search(latest):
         lines.append("You have been using bold text or lists. This is a chat — plain sentences only.")
-    echoes = 0
-    for reply, said in zip(replies[-4:], user_turns[-5:-1] if len(user_turns) > 1 else []):
-        lowered = said.lower()
-        if any(match.group(1).lower() in lowered for match in QUOTED.finditer(reply)):
-            echoes += 1
-    if echoes >= 2:
-        lines.append("You keep quoting their own words back at them in quotation marks. Don't.")
+    # These notes work like a thermostat: obeyed every time they fire (10 of 10
+    # on a replay), and the habit is back as soon as they stop. For a habit we
+    # never want, the note therefore turns STICKY once the habit is established
+    # — and it names no examples: quoted samples in the note primed more quoting.
+    quoted_recently = sum(bool(SCARE_QUOTES.search(reply)) for reply in replies[-12:])
+    if quoted_recently >= 3 or sum(bool(SCARE_QUOTES.search(reply)) for reply in window) >= 2:
+        lines.append(
+            "You have a habit of putting phrases in quotation marks. Write this reply with no "
+            "quotation marks at all — say things in your own words."
+        )
+    if sum(bool(SIGN_OFFS.search(reply.strip())) for reply in window) >= 2:
+        lines.append(
+            "You keep closing on a pep-talk line (\"you've got this\", \"you earned it\", \"I'll be here\"). "
+            "End on something about THEM or the thing itself, or just stop."
+        )
     return lines
 
 

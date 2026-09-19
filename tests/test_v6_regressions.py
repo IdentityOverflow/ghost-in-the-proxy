@@ -811,3 +811,16 @@ def test_quick_thoughts_stay_out_of_tool_using_clients(tmp_path):
 
     assert "How to talk" in asyncio.run(go(None))
     assert "How to talk" not in asyncio.run(go([tool, tool, tool]))
+
+
+def test_scare_quote_note_turns_sticky_once_the_habit_is_established():
+    from server.mind.thoughts import observe
+
+    users = ["so anyway the move was rough and the new kitchen is chaos honestly"] * 12
+    quoting = 'That "new kitchen" chaos is real. ' + "word " * 20
+    clean = "Kitchens are like that for the first month. " + "word " * 20
+    # established habit, then three clean replies: the note must still be there
+    lines = observe(users, [quoting, clean, quoting, clean, quoting, clean, clean, clean])
+    assert any("no quotation marks" in line.lower() or "quotation marks" in line for line in lines)
+    assert not any("“" in line or '"' in line for line in lines if "quotation" in line)  # no primed samples
+    assert not any("quotation" in line for line in observe(users, [clean] * 8))

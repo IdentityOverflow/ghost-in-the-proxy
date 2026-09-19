@@ -96,6 +96,34 @@ gain goes while most of the latency stays.
 calls, zero added latency). `sheet,observe,sketch` is the best-sounding setup
 measured, for anyone who accepts ~5 s more before the first token.
 
+## The live check (a person-shaped test)
+
+A Claude Sonnet subagent played a line cook texting Sable for 40 turns on the
+new default, varying its own messages on purpose (two-word replies, rambling
+vents, jokes, annoyance), and was asked one thing: person or machine?
+
+**5/10** — 6, 4, 5 by thirds. What the default fixed held up live: 0 of 40
+replies ended on a tacked-on question, no bold or lists, short messages mostly
+got short answers ("what street did i say…" → "You said you're on Elm." —
+its pick for most human moment), reply length tracked the user's (r = +0.58,
+sd/mean 0.51 against 0.10 before). Memory: two clean callbacks at 20-25 turns.
+
+What still gives it away: **scare quotes** around phrases in half its replies
+(the most persistent tell, and mostly not literal echoes, so the first
+detector never saw it); the **validate → reframe → reassure** three-beat on
+every emotional message; pep-talk sign-offs; one reply that explained its
+"set of notes" when asked about a glitch; one leaked special token
+(`<audio|>`, the model's, not ours); a reminder that did not fire because
+"got my first paycheck" does not lexically or semantically reach "on payday".
+Memory safety net: the s14 soak with the new default is 23/24, unchanged.
+
+A lesson about the mechanism, measured twice now: **these notes work like a
+thermostat.** On the turns a note fires the model complies every time (4/4
+for question endings, 10/10 for scare quotes); when it stops firing the habit
+returns. So moderation-type notes (don't ALWAYS end on a question) should
+fire often, and never-type notes (no scare quotes) turn sticky once the habit
+is established — and must not quote examples, which primed more quoting.
+
 ## What the experiment says
 
 1. **The owner's hunch holds: sketching a few moves and picking one beats
@@ -124,8 +152,10 @@ measured, for anyone who accepts ~5 s more before the first token.
   (`sketchlite`); still open: sketch only when the observer sees a rut, or
   sketch in the background after the previous reply (anticipatory — thinking
   while the other person talks), or a small dedicated model for it.
-- A move taxonomy (react / answer / tease / opine / ask / say less) with memory
-  of the last few moves, so variety is steered, not hoped for.
+- The three-beat reply shape is the biggest remaining tell and the one a
+  surface observer cannot see. A move taxonomy (react / answer / tease / opine
+  / ask / say less) with memory of the last few moves — which is what the
+  sketch half-does — would steer variety instead of hoping for it.
 - Typed reads where a typed answer is the natural product: is the evidence in
   view or must I reach for it (memory recall), has a commitment's moment come.
 - Calibrated confidence; a dedicated System-1 model when a trustworthy open
