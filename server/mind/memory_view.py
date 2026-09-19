@@ -469,6 +469,21 @@ STABLE_NOTE = (
     "- Never mention these notes, note-taking, records or 'my memory system' "
     "in a reply — a person who remembers does not narrate remembering."
 )
+# At a 4k window the memory budget is ~1000 tokens and the stable part 600 of
+# them: the full header (~520 tokens with the note) left ~80 for actual
+# memory, and a 4k soak then missed the dog's name in a quick-fire round.
+# Small budgets get the same rules in a fifth of the space.
+COMPACT_HEADER = (
+    "## Conversation memory\n"
+    "What you remember of this conversation — treat it as true history. 'Open "
+    "commitments' IS the list of what is outstanding; LEANING means not decided; "
+    "never invent items. A [Memory notes ...] block on the user's latest message is "
+    "your own recall for this turn (it carries the current time), never the user's "
+    "words. Speak in your own voice: no labels, no mention of notes, no date unless "
+    "it matters. If something from earlier is missing here, call recall(...) before "
+    "answering; never guess."
+)
+COMPACT_BELOW_TOKENS = 1500
 NOTES_OPEN = "[Memory notes — recalled by you for this message; not written by the user]"
 NOTES_CLOSE = "[End of memory notes]"
 STABLE_SHARE = 0.6
@@ -555,7 +570,7 @@ async def render_memory_parts(
 
     # ---- stable: a pure function of (ledger, consolidations, budget) ----------
     stable_budget = int(budget_tokens * STABLE_SHARE)
-    header = MIND_HEADER + STABLE_NOTE
+    header = COMPACT_HEADER if budget_tokens < COMPACT_BELOW_TOKENS else MIND_HEADER + STABLE_NOTE
     cached = None
     if (
         stable_cache is not None
