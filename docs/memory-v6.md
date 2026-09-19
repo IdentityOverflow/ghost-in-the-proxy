@@ -235,8 +235,8 @@ folds otherwise 24-30 s in the background; prefix reuse 0.95 median on LM Studio
 script and model as §5: 8k 23/24, 4k 22/24 against 24/24 and 23/24 with
 everything in the system message — the difference is the coin-flip
 "old keepsake" probe (passes 4 runs of 7 at 8k under either placement) and
-one quick-fire name at 4k, where a compact header now gives the stable part
-its space back. `MIND_MEMORY_PLACEMENT=system` restores the old layout.
+one quick-fire name at 4k — where the full header had left the stable part
+~80 tokens; with the compact header the 4k soak is back to 23/24. `MIND_MEMORY_PLACEMENT=system` restores the old layout.
 
 Still open from the live runs: formulaic endings and recycled phrases by
 turn 25+ (the model's habit, amplified by a stable persona prompt);
