@@ -6,7 +6,7 @@ with memory and personality", in build order. Synthesized from a design
 consultation between Claude and gpt-6-astra (2026-09-19); where we differ it
 says so.
 
-## A — A cache contract (make every turn cheap)
+## A — A cache contract (make every turn cheap) — BUILT, see docs/memory-v6.md §6
 
 **Problem.** On a laptop backend (LM Studio, gemma-4-12b, 8k) a turn costs
 ~100 s, nearly all of it prompt processing: the system message changes EVERY

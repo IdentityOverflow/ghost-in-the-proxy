@@ -205,7 +205,40 @@ model says so instead of calling recall (told to, still does not — the s13
 finding again). Closing that gap is query expansion by the model itself,
 which is what phase C of docs/roadmap.md is for.
 
-## 6. Not in this phase
+## 6. The cache contract and live use (2026-09-19, later the same day)
+
+Three unscripted 45-50 turn conversations on the owner's laptop (LM Studio,
+gemma-4-12b, 8k, reasoning off), each with a Claude Sonnet subagent playing a
+person through `evals/livechat.py` and keeping a private list of what it had
+said. Memory held: 10/10, then 9/11 with two honest "you never told me
+that", then 9/10 callbacks at distances up to 42 turns, corrections never
+regressed, no confabulation in any run. What the runs really measured was
+how it FEELS:
+
+| what the user felt | cause | fix |
+|---|---|---|
+| ~20 s to first token on EVERY turn once memory existed (1.6 s before) | the single memory section changes every turn — the clock line alone — so the backend's prefix cache never hits and 6k tokens are reprocessed | **stable/volatile split**: what changes only when a fold lands stays in the system message (membership and order independent of cue and clock, own budget, pinned to the ledger revision because calibration jitter moves the budget); the clock, due status, cue-recalled records, active threads and verbatim spans ride in a marked block on the LATEST user message, render-only |
+| still slow with the split | newest-first texture filling evicted one covered block per turn: the prompt's second message changed every turn | the texture may only START at a fold boundary — it moves when a fold lands, which is when the system message changes anyway |
+| one 160-170 s turn per conversation | the first fold came only when texture alone filled the window; its new ~1.3k-token memory section then overflowed the guard, evicted uncovered events and forced a SYNCHRONOUS second fold | the memory budget is reserved from turn one — in the background pass too, which is where fold pressure is measured |
+| 45-85 s stalls when replying quickly after a fold-worthy turn | LM Studio has one slot: a background fold (30-90 s locally) queues ahead of the next message | bounded wait (60 s) and earlier, smaller folds help; the real fix is `MIND_EXTRACTION_MODEL=provider:model` on another backend |
+| a reminder did not fire when its trigger came up ("payday is this friday") | the commitment was merely listed | a trigger match is said plainly in the per-turn notes, once per commitment (3/3 fired unprompted in the next run) |
+| "(And I've noted it's Saturday, 2026...)", "I've updated my notes", a recap reproducing "(Triggered whenever ...)" | notes formatting and the clock line invite narration | commitments render as plain sentences; header: own voice, no date unprompted, never mention notes. Reduced, not eliminated, on a 12B model |
+
+Measured after the split: time to first token **median 1.9 s, p90 3.0 s**
+(was ~20 s on every post-fold turn); prefix reuse 0.95 median on LM Studio,
+0.81 on the OpenRouter soak (from 0.12). Soak quality with the split, same
+script and model as §5: 8k 23/24, 4k 22/24 against 24/24 and 23/24 with
+everything in the system message — the difference is the coin-flip
+"old keepsake" probe (passes 4 runs of 7 at 8k under either placement) and
+one quick-fire name at 4k, where a compact header now gives the stable part
+its space back. `MIND_MEMORY_PLACEMENT=system` restores the old layout.
+
+Still open from the live runs: formulaic endings and recycled phrases by
+turn 25+ (the model's habit, amplified by a stable persona prompt);
+a resolved reminder stays "open" until the next fold closes it; a recap can
+contradict itself when the ledger holds a stale fact next to a newer one.
+
+## 7. Not in this phase
 
 See docs/roadmap.md: the cache contract (prefix-cache-friendly workspace),
 one mind across conversations (agent identity + self-model), quick thoughts.
