@@ -94,17 +94,24 @@ on a laptop only if phase A makes the two-call turn cheaper than today's
 one. Never for routine chat, exact transformations, tool continuations, or
 tasks that need real reasoning.
 
-**First customer: the steward itself.** Measured on the owner's laptop
-(LM Studio, gemma-4-12b — which, despite the "reasoning disabled" UI setting,
-spends ~2400 reasoning tokens per API call): the same fold span extracted 4
-facts in 233 s unconstrained, and 1 fact in 20 s under the strict JSON schema
-(the grammar suppresses the think block — and with it, recall). A `"noticed"`
-list as the FIRST schema property ("every durable thing the user said, a few
-words each", then one op per item) is exactly a quick thought. First attempt
-timed out at 300 s locally: with thinking suppressed the model pours its
-chain of thought into the first free-text field, so the strings need hard
-length bounds (and the grammar cost of `maxLength`/`maxItems` on llama.cpp
-needs measuring). Worth doing before anything user-facing.
+**A finding that belongs here.** On the owner's laptop (LM Studio,
+gemma-4-12b) every API call was silently reasoning — the UI's "reasoning
+disabled" does not apply to the API; `{"reasoning_effort":"none"}` does
+(`LMSTUDIO_EXTRA_BODY`). Same fold span, same model:
+
+| mode | time | extracted |
+|---|---|---|
+| reasoning on, unconstrained | 233 s (2430 think tokens) | 4 facts |
+| reasoning on, strict schema (grammar suppresses the think block) | 20 s | 1 fact |
+| **reasoning off, strict schema** | **32 s** | **5 facts + thread, names core** |
+| reasoning off, unconstrained | 20 s | 4 facts + 1 decision |
+
+So long CoT bought nothing here, and a model that WANTS to think but is
+gagged by a grammar does worse than one told not to think at all — a small
+data point for the quick-thoughts thesis. A `"noticed"` list as the first
+schema property (enumerate, then write ops) was tried once with reasoning
+still on and timed out: the model poured its chain of thought into the first
+free-text field. Worth retrying with reasoning off and bounded strings.
 
 ## Order
 
