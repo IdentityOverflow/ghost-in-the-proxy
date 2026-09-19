@@ -1,18 +1,19 @@
-# Agent Guidelines for Project-2501
+# Agent Guidelines for ghost-in-the-proxy
 
 ## Build/Run/Test
 - **Run dev server**: `PYTHONPATH=. uvicorn server.main:app --reload --host 0.0.0.0 --port 8000` (from project root)
 - **Run with Docker**: `docker-compose up --build` (from project root)
-- **No test suite configured yet** - follow FastAPI/pytest patterns if adding tests
+- **Tests**: `pytest tests/` (conda env `ghost`); long-conversation soak: `python -m evals.run --scenario s14-soak` + `python -m evals.soak_report`
 
 ## Project Structure
 ```
-Project-2501/
+ghost-in-the-proxy/
 ├── server/              # Backend API
 │   ├── main.py         # Entry point
 │   ├── endpoints/      # Route handlers
 │   ├── routing/        # Provider routing logic
-│   └── providers/      # Provider implementations
+│   ├── providers/      # Provider implementations
+│   └── mind/           # Cognitive middleware (docs/architecture.md, docs/memory-v6.md)
 └── client/             # (Future) Frontend
 ```
 

@@ -19,6 +19,8 @@ class Settings(BaseModel):
 
     openrouter_base_url: str | None = os.getenv("OPENROUTER_BASE_URL")
     openrouter_api_key: str | None = os.getenv("OPENROUTER_API_KEY")
+    # JSON merged under every OpenRouter request, e.g. {"reasoning":{"enabled":false}}
+    openrouter_extra_body: dict = json.loads(os.getenv("OPENROUTER_EXTRA_BODY", "{}"))
 
 
     azure_openai_base_url: str | None = os.getenv("AZURE_OPENAI_BASE_URL")
