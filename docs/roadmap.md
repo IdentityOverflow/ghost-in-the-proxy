@@ -115,6 +115,12 @@ free-text field. Worth retrying with reasoning off and bounded strings.
 
 ## Order
 
-A → B → C. A makes iteration (and the laptop) affordable; B establishes
-durable identity and truth; C earns admission only by moving measured
-failures.
+A (built) → **C** → B. Owner's call, 2026-09-19: if one conversation can
+stay coherent indefinitely, a mind shared across chats is not urgent; quick
+thoughts are where the value is. B stays on the map for when "new chat"
+amnesia starts to hurt. C still has to earn its place by moving measured
+failures — and now has a first live data point to build on: a specific,
+current, machine-made observation placed at the end of the context changes a
+12B model's behaviour where a standing instruction does not (the rhythm note:
+replies ending on a question 75% -> 46% on a replayed conversation, obeyed
+every time it fired).

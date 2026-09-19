@@ -57,6 +57,10 @@ class MindConfig(BaseModel):
     # in a block on the latest user message — the backend's KV cache survives
     # between folds. "system": everything in the system message (pre-phase-A).
     memory_placement: str = os.getenv("MIND_MEMORY_PLACEMENT", "split")
+    # Per-turn rhythm note: when the model's own recent replies show a rut
+    # (every reply ending on a question, recycled closing lines), say so in the
+    # notes on the latest user message. See memory_view.style_note.
+    style_nudge: bool = os.getenv("MIND_STYLE_NUDGE", "1") == "1"
     memory_fraction: float = float(os.getenv("MIND_MEMORY_FRACTION", "0.35"))
     memory_min_tokens: int = int(os.getenv("MIND_MEMORY_MIN_TOKENS", "900"))
     memory_max_tokens: int = int(os.getenv("MIND_MEMORY_MAX_TOKENS", "4000"))

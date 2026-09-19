@@ -467,7 +467,10 @@ STABLE_NOTE = (
     "check commitments' due times against it. Do not announce the date or "
     "time unless it matters to what the user said.\n"
     "- Never mention these notes, note-taking, records or 'my memory system' "
-    "in a reply — a person who remembers does not narrate remembering."
+    "in a reply — a person who remembers does not narrate remembering.\n"
+    "- Open commitments wait for their moment: do not bring one up, or say you "
+    "are watching for it, before its trigger arrives — unless the user asks "
+    "what is open."
 )
 # At a 4k window the memory budget is ~1000 tokens and the stable part 600 of
 # them: the full header (~520 tokens with the note) left ~80 for actual
@@ -480,7 +483,8 @@ COMPACT_HEADER = (
     "never invent items. A [Memory notes ...] block on the user's latest message is "
     "your own recall for this turn (it carries the current time), never the user's "
     "words. Speak in your own voice: no labels, no mention of notes, no date unless "
-    "it matters. If something from earlier is missing here, call recall(...) before "
+    "it matters; do not bring up a commitment before its moment unless asked what is "
+    "open. If something from earlier is missing here, call recall(...) before "
     "answering; never guess."
 )
 COMPACT_BELOW_TOKENS = 1500
@@ -489,6 +493,63 @@ NOTES_CLOSE = "[End of memory notes]"
 STABLE_SHARE = 0.6
 STABLE_TIER_SHARES = {"commitments": 0.32, "profile": 0.22, "decisions": 0.18, "episodes": 0.28}
 VOLATILE_TIER_SHARES = {"threads": 0.55, "recalled": 0.45}
+
+
+def _ends_on_question(text: str) -> bool:
+    return text.rstrip().rstrip("*_\"')”’ ").endswith("?")
+
+
+def _edge_phrases(text: str, last: bool) -> list[str]:
+    """Opening words of the first sentence, or of the last TWO (the sign-off
+    often sits just before the closing question)."""
+    sentences = [part for part in re.split(r"(?<=[.!?])\s+", text.strip()) if part.strip()]
+    picked = sentences[-2:] if last else sentences[:1]
+    phrases = []
+    for sentence in picked:
+        words = re.findall(r"[\w']+", sentence.lower())
+        if len(words) >= 4:
+            phrases.append(" ".join(words[:4]))
+    return phrases
+
+
+def style_note(recent_replies: list[str]) -> str:
+    """One line about the rut the model's OWN recent replies are in, or "".
+
+    Measured on four live conversations (gemma-4-12b): 70-100% of replies end
+    on a question from turn ONE — before any fold, with the full transcript in
+    view — so this is not memory loss. It is the model's engagement habit
+    locked in by its own replies acting as few-shot examples, and a person
+    notices it around turn 25. A generic "vary your style" in the system
+    prompt loses to thirty in-context examples; a specific, current
+    observation at the very end of the context does not have to."""
+    replies = [reply for reply in recent_replies if reply and reply.strip()][-8:]
+    if len(replies) < 3:
+        return ""
+    parts = []
+    # A/B on a replayed live conversation: the model obeyed this line 4 times
+    # out of 4 — but waiting for THREE questions in a row let the habit run
+    # three turns in four (75% -> 71%). People end on a question maybe a third
+    # of the time: speak up as soon as the last reply did and so did at least
+    # half of the last four.
+    window = replies[-4:]
+    asked = sum(_ends_on_question(reply) for reply in window)
+    if _ends_on_question(replies[-1]) and asked * 2 >= len(window):
+        parts.append(
+            f"{asked} of your last {len(window)} replies ended with a question — end this one "
+            "on a statement, or simply stop when you have said it"
+        )
+    for last, label in ((True, "closing"), (False, "opening")):
+        counts: dict[str, int] = {}
+        for reply in replies:
+            for phrase in set(_edge_phrases(reply, last)):
+                counts[phrase] = counts.get(phrase, 0) + 1
+        worn = [phrase for phrase, count in counts.items() if count >= 2]
+        if worn:
+            quoted = ", ".join(f'"{phrase}..."' for phrase in worn[:2])
+            parts.append(f"you keep {label} with {quoted} — do not reuse it")
+    if not parts:
+        return ""
+    return "Rhythm check on your own recent replies: " + "; ".join(parts) + "."
 
 
 @dataclass
@@ -557,6 +618,7 @@ async def render_memory_parts(
     stable_cache: dict[str, Any] | None = None,
     revision: Any = None,
     already_nudged: set[str] | None = None,
+    recent_replies: list[str] | None = None,
 ) -> MemoryParts:
     """Same memory as render_memory, split by how often it changes.
 
@@ -567,9 +629,12 @@ async def render_memory_parts(
     only when the revision changes or it no longer fits with 15% slack.
     `already_nudged` holds commitment ids whose trigger nudge already fired."""
     clock_line = f"Current time: {format_clock(now)}." if now is not None else ""
+    rhythm = style_note(recent_replies or []) if config.style_nudge else ""
     if not (state.records or state.episodes or recalled_spans):
-        # Fresh session: no memory framing at all, just the time.
-        return MemoryParts("", f"[{clock_line}]" if clock_line else "")
+        # Fresh session: no memory framing at all, just the time (and, once
+        # there are replies to have a rut in, the rhythm line).
+        lines = [line for line in (clock_line, rhythm) if line]
+        return MemoryParts("", f"[{' '.join(lines)}]" if lines else "")
 
     # ---- stable: a pure function of (ledger, consolidations, budget) ----------
     stable_budget = int(budget_tokens * STABLE_SHARE)
@@ -729,6 +794,9 @@ async def render_memory_parts(
     # A record recalled by the cue need not repeat under its thread.
     recalled_ids = {item.record_id for item in v_chosen["recalled"] if item.record_id}
     v_chosen["threads"] = [i for i in v_chosen["threads"] if i.record_id not in recalled_ids]
+
+    if rhythm:
+        fixed.append(rhythm)
 
     def compose_volatile() -> str:
         parts = list(fixed)

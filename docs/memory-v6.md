@@ -238,8 +238,20 @@ everything in the system message — the difference is the coin-flip
 one quick-fire name at 4k — where the full header had left the stable part
 ~80 tokens; with the compact header the 4k soak is back to 23/24. `MIND_MEMORY_PLACEMENT=system` restores the old layout.
 
-Still open from the live runs: formulaic endings and recycled phrases by
-turn 25+ (the model's habit, amplified by a stable persona prompt);
+**Formulaic endings** looked like memory decay ("by turn 25") and are not:
+70-100% of replies end on a question from turn ONE, before any fold, with the
+whole transcript in view — the model's engagement habit, locked in by its own
+replies acting as few-shot examples; a person just notices around turn 25.
+The per-turn notes now carry a rhythm line computed from the model's own
+recent replies ("3 of your last 4 replies ended with a question — end this one
+on a statement"; worn opening/closing phrases quoted back). Same 24 user
+turns replayed: 75% -> 46% ending on a question, reply length unchanged,
+obeyed every time it fired — where header instructions had done nothing.
+Side effect seen once told not to ask: reaching for an open commitment as a
+sign-off ("(And I haven't forgotten the passport!)"); the header now says
+commitments wait for their moment. `MIND_STYLE_NUDGE=0` turns the line off.
+
+Still open from the live runs: recycled stock phrases mid-reply;
 a resolved reminder stays "open" until the next fold closes it; a recap can
 contradict itself when the ledger holds a stale fact next to a newer one.
 

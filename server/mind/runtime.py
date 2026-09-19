@@ -331,6 +331,11 @@ class MindRuntime:
                     len(consolidations), consolidations[-1]["seq"] if consolidations else 0,
                 ),
                 already_nudged=nudged_trial,
+                recent_replies=[
+                    text
+                    for event in events[-24:]
+                    if event.role == "assistant" and (text := content_text(event.message))
+                ],
             )
             memory_text, volatile_text = parts.stable, parts.volatile
         else:

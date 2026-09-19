@@ -728,3 +728,20 @@ def test_runtime_never_folds_on_the_request_path_in_a_steady_conversation(tmp_pa
     # Over the soft budget is allowed while a fold catches up; over the hard
     # limit never (that is what evicts uncovered truth and forces a sync fold).
     assert worst <= token_budgets(runtime.config)[1]
+
+
+def test_style_note_names_the_rut_and_stays_quiet_otherwise():
+    from server.mind.memory_view import style_note
+
+    rut = [
+        "Nice work. I'll be here whenever you need me. How does it feel?",
+        "Good plan. What comes next?",
+        "Solid. I'll be here whenever you need me. Ready for it?",
+    ]
+    note = style_note(rut)
+    assert "3 of your last 3 replies ended with a question" in note
+    assert "i'll be here whenever" in note
+    assert style_note(["All done.", "Fine then, that settles it.", "Ok!"]) == ""
+    assert style_note(rut[:2]) == ""  # too little evidence to call it a habit
+    # a statement breaks the streak
+    assert "ended with a question" not in style_note(rut + ["That is that."])
