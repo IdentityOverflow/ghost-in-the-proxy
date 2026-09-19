@@ -42,13 +42,21 @@ python -m evals.run --base-url http://127.0.0.1:8000/v1 --model <model> --label 
 
 ```bash
 pip install -r server/requirements.txt
-MIND_ENABLED=1 MIND_WINDOW=8192 DEFAULT_PROVIDER=lmstudio LMSTUDIO_BASE_URL=http://localhost:1234 \
-  uvicorn server.main:app --host 0.0.0.0 --port 8000
+uvicorn server.main:app --port 8000
 ```
 
-Point any OpenAI-compatible client at it. With `MIND_ENABLED` unset the server is a faithful passthrough (that bare proxy lives on as its own project: [LLM-passthrough-endpoint](https://github.com/IdentityOverflow/LLM-passthrough-endpoint)).
+That is the whole command: [`ghost.env`](ghost.env) is the committed config file, and its defaults start the mind against a local LM Studio (`http://127.0.0.1:1234`, 8k window, bge-m3 embeddings, reasoning off). Edit it, or override per machine in a gitignored `.env` (API keys go there); anything exported in the shell wins over both. `GHOST_CONFIG=path` selects a different file.
 
-Key environment variables (see `server/mind/config.py` for all):
+Point any OpenAI-compatible client at `http://localhost:8000/v1`. With `MIND_ENABLED=0` the server is a faithful passthrough (that bare proxy lives on as its own project: [LLM-passthrough-endpoint](https://github.com/IdentityOverflow/LLM-passthrough-endpoint)).
+
+To feel it as a user — a file-backed chat client that resends the full transcript each turn and records time-to-first-token:
+
+```bash
+python -m evals.livechat --session me "Hi, I'm planning a garden."
+python -m evals.livechat --session me --stats
+```
+
+Key settings (all in `ghost.env`; see `server/mind/config.py` for every knob):
 
 | variable | default | meaning |
 |---|---|---|

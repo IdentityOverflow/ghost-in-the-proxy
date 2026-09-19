@@ -2,6 +2,12 @@
 import os
 from pydantic import BaseModel
 
+from ..env import load_env
+
+# The fields below read os.getenv at class-definition time: the config file
+# must be loaded before that, whoever imports this module first.
+load_env()
+
 
 class MindConfig(BaseModel):
     enabled: bool = os.getenv("MIND_ENABLED", "0") == "1"

@@ -1,7 +1,7 @@
 # Agent Guidelines for ghost-in-the-proxy
 
 ## Build/Run/Test
-- **Run dev server**: `PYTHONPATH=. uvicorn server.main:app --reload --host 0.0.0.0 --port 8000` (from project root)
+- **Run dev server**: `uvicorn server.main:app --reload --port 8000` (from project root; config comes from `ghost.env`, local overrides from `.env`)
 - **Run with Docker**: `docker-compose up --build` (from project root)
 - **Tests**: `pytest tests/` (conda env `ghost`); long-conversation soak: `python -m evals.run --scenario s14-soak` + `python -m evals.soak_report`
 
@@ -24,7 +24,7 @@ ghost-in-the-proxy/
 - **Types**: Use Pydantic models for all request/response schemas; type hint all function signatures
 - **Naming**: snake_case for functions/variables, PascalCase for classes, UPPERCASE for constants/globals
 - **Error handling**: Use FastAPI `HTTPException` with status codes; let httpx errors propagate with `raise_for_status()`
-- **Config**: All env vars loaded via `pydantic.BaseModel` in `config.py`; use `settings` singleton
+- **Config**: `ghost.env` (committed defaults) < `.env` (local) < shell env, loaded by `server/env.py`; env vars surface via `pydantic.BaseModel` in `config.py` / `mind/config.py`. Tests set `GHOST_NO_CONFIG=1`.
 - **Providers**: New providers extend `OpenAILikeProvider` pattern; register in `routing/router.py:PROVIDERS`
 - **Streaming**: Use `AsyncIterator[bytes]` for SSE; pass raw chunks through without parsing
 - **Models**: Support model mapping via `MODEL_MAP` env var (format: `{"alias":"provider:actual_model"}`)

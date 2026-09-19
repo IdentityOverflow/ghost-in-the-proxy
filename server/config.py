@@ -1,9 +1,9 @@
 from pydantic import BaseModel
 import os, json
-from dotenv import load_dotenv
+from .env import load_env
 
-# Load environment variables from .env file
-load_dotenv()
+# ghost.env (committed defaults) + .env (local overrides); see server/env.py
+load_env()
 
 
 class Settings(BaseModel):
