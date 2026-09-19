@@ -225,7 +225,12 @@ how it FEELS:
 | "(And I've noted it's Saturday, 2026...)", "I've updated my notes", a recap reproducing "(Triggered whenever ...)" | notes formatting and the clock line invite narration | commitments render as plain sentences; header: own voice, no date unprompted, never mention notes. Reduced, not eliminated, on a 12B model |
 
 Measured after the split: time to first token **median 1.9 s, p90 3.0 s**
-(was ~20 s on every post-fold turn); prefix reuse 0.95 median on LM Studio,
+(was ~20 s on every post-fold turn). Replaying the third conversation's user
+turns against the final build (20 s pauses): no fold on the request path,
+the 161 s turn gone; what remains is one ~60 s wait behind the first, largest
+background fold (90 s, 21 ops — early conversation is fact-dense) and
+15-20 s to first token on the turn a fold lands (the one honest cache miss),
+folds otherwise 24-30 s in the background; prefix reuse 0.95 median on LM Studio,
 0.81 on the OpenRouter soak (from 0.12). Soak quality with the split, same
 script and model as §5: 8k 23/24, 4k 22/24 against 24/24 and 23/24 with
 everything in the system message — the difference is the coin-flip
