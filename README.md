@@ -68,6 +68,7 @@ Key environment variables (see `server/mind/config.py` for all):
 | `MIND_STEWARD_JSON_SCHEMA` | `1` | ask the backend for schema-constrained steward output (auto-disabled if refused) |
 | `MIND_METRICS_PATH` | unset | JSONL telemetry: per-request sizes, per-fold outcomes |
 | `PROVIDER_RETRIES` | `0` | retry transient upstream errors on non-streaming calls |
+| `LMSTUDIO_EXTRA_BODY` / `OPENROUTER_EXTRA_BODY` | `{}` | JSON merged under every request to that provider (the client's own fields win). `{"reasoning_effort":"none"}` is what switches thinking off for LM Studio API calls — the UI toggle does not; OpenRouter takes `{"reasoning":{"enabled":false}}` |
 
 ```bash
 pytest tests/   # unit tests: perception, store invariants, assembler, dynamics, recall, router

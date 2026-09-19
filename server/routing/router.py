@@ -15,7 +15,8 @@ if settings.azure_openai_base_url and settings.azure_openai_api_key:
     PROVIDERS["azure"] = OpenAILikeProvider("azure", settings.azure_openai_base_url, settings.azure_openai_api_key,
         extra_headers={"api-version": settings.azure_openai_api_version} if settings.azure_openai_api_version else {})
 if settings.lmstudio_base_url:
-    PROVIDERS["lmstudio"] = OpenAILikeProvider("lmstudio", settings.lmstudio_base_url)
+    PROVIDERS["lmstudio"] = OpenAILikeProvider("lmstudio", settings.lmstudio_base_url,
+        extra_body=settings.lmstudio_extra_body)
 if settings.ollama_base_url:
     PROVIDERS["ollama"] = OpenAILikeProvider("ollama", settings.ollama_base_url)
 

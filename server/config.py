@@ -29,6 +29,11 @@ class Settings(BaseModel):
 
 
     lmstudio_base_url: str | None = os.getenv("LMSTUDIO_BASE_URL")
+    # JSON merged under every LM Studio request. {"reasoning_effort":"none"}
+    # is what actually switches thinking off for API calls on reasoning
+    # models (measured on gemma-4-12b: 190 -> 12 completion tokens for a
+    # one-line answer; the UI toggle does not apply to the API).
+    lmstudio_extra_body: dict = json.loads(os.getenv("LMSTUDIO_EXTRA_BODY", "{}"))
     ollama_base_url: str | None = os.getenv("OLLAMA_BASE_URL")
 
     # When set, replaces the client's system prompt for every request.
