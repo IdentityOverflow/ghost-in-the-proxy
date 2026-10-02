@@ -1,6 +1,6 @@
 # ghost-in-the-proxy
 
-**A persistent, structured, mind architecture for any OpenAI-compatible model — instead of a context window full of dead transcript.**
+**A persistent, structured, cognitive architecture for any OpenAI-compatible model — instead of a context window full of dead transcript.**
 
 This is an OpenAI-compatible proxy with a cognitive middleware inside. Your client talks to it exactly like it would talk to the model; the model never sees the client's raw transcript. Instead, the mind treats the incoming transcript as a *sensory event stream*, maintains its own persistent state per conversation, and assembles the model's entire context fresh on every request: distilled memory plus verbatim recent texture, inside a fixed budget that stays flat no matter how long the conversation runs.
 
