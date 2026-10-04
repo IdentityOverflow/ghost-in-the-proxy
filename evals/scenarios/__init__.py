@@ -16,10 +16,24 @@ from .s13_sequence_recall import SCENARIO as S13
 ALL_SCENARIOS: list[Scenario] = [S1, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11, S12, S13]
 
 
+# Opt-in scenarios: too long for the default suite, built lazily, selected
+# only by explicit --scenario id.
+def _build_soak() -> Scenario:
+    from .s14_soak import build
+
+    return build()
+
+
+OPT_IN_SCENARIOS = {"s14-soak": _build_soak}
+
+
 def get_scenarios(ids: list[str] | None = None) -> list[Scenario]:
     if not ids:
         return list(ALL_SCENARIOS)
     by_id = {scenario.id: scenario for scenario in ALL_SCENARIOS}
+    for wanted in ids:
+        if wanted in OPT_IN_SCENARIOS:
+            by_id[wanted] = OPT_IN_SCENARIOS[wanted]()
     missing = [wanted for wanted in ids if wanted not in by_id]
     if missing:
         known = ", ".join(by_id)

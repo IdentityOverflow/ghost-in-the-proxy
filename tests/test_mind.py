@@ -1,9 +1,13 @@
-"""Mind v0: perception reconciliation, event store invariants, assembler budget."""
+"""Mind regressions: reconciliation, fold store, bounded workspace, and retrieval."""
+
+import asyncio
 
 import pytest
 
 from server.mind.assembler import assemble, estimate_tokens
 from server.mind.config import MindConfig
+from server.mind.ledger import Episode, LedgerState, Record, replay
+from server.mind.memory_view import MIND_HEADER, ThreadsView, render_memory
 from server.mind.perception import reconcile
 from server.mind.store import MindStore
 
@@ -17,6 +21,16 @@ def config(**overrides) -> MindConfig:
     base = dict(enabled=True, db_dir="unused", window=4096)
     base.update(overrides)
     return MindConfig(**base)
+
+
+def ledger_state(records=None, episodes=()):
+    state = LedgerState()
+    for kind, items in (records or {}).items():
+        for data in items:
+            rid = f"r{len(state.records) + 1}"
+            state.records[rid] = Record(rid, kind, dict(data))
+    state.episodes = [Episode(i, start, end, text) for i, (start, end, text) in enumerate(episodes, 1)]
+    return state
 
 
 def user(text):
@@ -139,6 +153,9 @@ class _RecordingMem:
     async def boundary(self, session_id, reason, upto_seq):
         self.boundaries.append((session_id, reason, upto_seq))
 
+    async def text_sims(self, query, texts):
+        return None
+
     async def query(self, session_id, query, events):
         from server.mind.mem import MemSpan
 
@@ -211,8 +228,11 @@ def test_mem_boundary_fires_on_fold(store, tmp_path, monkeypatch):
     runtime = MindRuntime(cfg)
     runtime.mem = _RecordingMem()
 
-    async def fake_steward(config, store_, session_id, events, provider, model, upto, now=None):
-        store_.append_summary(session_id, upto, "condensed")
+    async def fake_steward(config, store_, session_id, events, provider, model, upto, now=None, mem=None, **_):
+        from server.mind.steward import FoldOutcome
+
+        store_.append_fold(session_id, events[0].seq, upto, [], "condensed")
+        return FoldOutcome(folds=1)
 
     monkeypatch.setattr(runtime_module, "run_steward", fake_steward)
 
@@ -317,16 +337,19 @@ def test_autocue_injects_folded_semantic_spans(store, tmp_path):
         ]
         prepared = await runtime.prepare(transcript, provider=None, model="m")
         # fold the tortoise turn out of view, then probe semantically
-        runtime.store.append_summary(prepared.session_id, 2, "earlier chatter")
+        runtime.store.append_fold(prepared.session_id, 1, 2, [], "earlier chatter")
         transcript += [assistant("gardening is nice"), user("who was the slow reptile?")]
         prepared2 = await runtime.prepare(transcript, provider=None, model="m")
-        system_text = prepared2.messages[0]["content"]
-        assert "Recalled verbatim" in system_text
-        assert "Muriel" in system_text
+        # Per-turn memory rides on the latest user message (phase A), never in
+        # the system message — that is what keeps the prefix cacheable.
+        notes = prepared2.messages[-1]["content"]
+        assert "Recalled verbatim" in notes and "Muriel" in notes
+        assert notes.endswith("who was the slow reptile?")
+        assert "Muriel" not in prepared2.messages[0]["content"]
         # on-topic lexical matches must NOT be auto-injected (sim filter):
         transcript += [assistant("it was Muriel"), user("more about gardening chatter please")]
         prepared3 = await runtime.prepare(transcript, provider=None, model="m")
-        assert "Recalled verbatim" not in prepared3.messages[0]["content"]
+        assert all("Recalled verbatim" not in str(m["content"]) for m in (prepared3.messages[0], prepared3.messages[-1]))
 
     asyncio.run(go())
 
@@ -432,16 +455,16 @@ def test_assembler_respects_budget_and_blocks(store):
         store.append_event(session, user(f"question {i} {long}"), source="client")
         store.append_event(session, assistant(f"answer {i} {long}"), source="mind")
     events = store.live_events(session)
-    summary = (events[-6].seq, "summary of earlier turns")
-
-    workspace = assemble(cfg, "sys", events, summary)
-    budget = cfg.window - max(int(cfg.window * cfg.reserve_fraction), 1024)
-    assert workspace.estimated_tokens <= budget
-    # Newest event always present; system carries client prompt + summary.
+    workspace = assemble(
+        cfg, "sys", events, covered_upto=events[-6].seq,
+        memory_text="summary of earlier turns",
+    )
+    # Newest event always present; system carries client prompt + memory.
     assert workspace.messages[0]["role"] == "system"
     assert "sys" in workspace.messages[0]["content"]
     assert "summary of earlier turns" in workspace.messages[0]["content"]
     assert workspace.messages[-1]["content"] == events[-1].message["content"]
+    assert workspace.estimated_tokens <= workspace.hard_limit_tokens
 
 
 def test_assembler_never_orphans_tool_results(store):
@@ -458,7 +481,7 @@ def test_assembler_never_orphans_tool_results(store):
     store.append_event(session, user("and now?"), source="client")
     events = store.live_events(session)
 
-    workspace = assemble(cfg, None, events, (0, ""))
+    workspace = assemble(cfg, None, events)
     roles = [m["role"] for m in workspace.messages]
     # If the tool result is present, its assistant tool_calls must precede it.
     if "tool" in roles:
@@ -475,22 +498,24 @@ def test_texture_always_opens_on_user_turn(store):
     events = store.live_events(session)
     # Summary boundary deliberately placed AFTER a user turn (worst case).
     for upto in (3, 4, 5, 12, 13):
-        workspace = assemble(cfg, None, events, (upto, "earlier turns summary"))
+        workspace = assemble(cfg, None, events, covered_upto=upto, memory_text="earlier turns summary")
         non_system = [m for m in workspace.messages if m["role"] != "system"]
         assert non_system[0]["role"] == "user", f"upto={upto} opened on {non_system[0]['role']}"
 
 
-def test_ledger_generation_versioning(store):
+def test_ledger_fold_versioning(store):
     session = store.create_session(None)
-    store.replace_records(session, {"fact": [{"subject": "port", "claim": "8080"}]}, provenance_seq=2)
-    store.replace_records(
-        session,
-        {"fact": [{"subject": "port", "claim": "9090 (was 8080)"}],
-         "commitment": [{"actor": "user", "statement": "rotate token", "status": "open"}]},
-        provenance_seq=6,
-    )
-    live = store.live_records(session)
-    assert live["fact"] == [{"subject": "port", "claim": "9090 (was 8080)"}]
+    for i in range(6):
+        store.append_event(session, user(f"turn {i}"), source="client")
+    store.append_fold(session, 1, 2, [
+        {"op": "add", "kind": "fact", "subject": "port", "claim": "8080"},
+    ], "initial port")
+    store.append_fold(session, 3, 6, [
+        {"op": "update", "id": "r1", "claim": "9090 (was 8080)"},
+        {"op": "add", "kind": "commitment", "actor": "user", "statement": "rotate token"},
+    ], "port corrected")
+    live = replay(store.live_folds(session)).grouped()
+    assert live["fact"] == [{"id": "r1", "subject": "port", "claim": "9090 (was 8080)"}]
     assert len(live["commitment"]) == 1
 
 
@@ -499,19 +524,18 @@ def test_fork_invalidates_derived_records(store):
     store.append_event(session, user("q1"), source="client")
     store.append_event(session, assistant("a1"), source="mind")
     store.append_event(session, user("q2"), source="client")
-    store.replace_records(session, {"fact": [{"subject": "x", "claim": "y"}]}, provenance_seq=3)
-    store.append_episode(session, 1, 3, "early events")
+    store.append_fold(session, 1, 3, [
+        {"op": "add", "kind": "fact", "subject": "x", "claim": "y"},
+    ], "early events")
     replacement = store.append_event(session, user("q2-edited"), source="client")
     store.supersede_from(session, 3, replacement)
-    assert store.live_records(session) == {}
-    assert store.live_episodes(session) == []
+    state = replay(store.live_folds(session))
+    assert state.records == {}
+    assert state.episodes == []
 
 
 def test_render_memory_sections():
-    from server.mind.assembler import render_memory
-
-    text = render_memory(
-        "",
+    state = ledger_state(
         {
             "decision": [{"topic": "sync", "status": "leaning", "choice": "Turnstile", "reason": "simple"}],
             "commitment": [
@@ -522,12 +546,14 @@ def test_render_memory_sections():
         },
         [(1, 6, "planned the app")],
     )
+    text = asyncio.run(render_memory(config(), state, [], None, "", None, 4000))
     assert "sync: LEANING (not yet decided) — Turnstile (reason: simple)" in text
     assert "rotate token — trigger: deployment" in text
     assert "old thing" not in text  # done commitments stay out of the open list
-    assert "port: 9090 (was 8080)" in text
+    assert "port: 9090 [outdated earlier value: 8080 — do not use]" in text
     assert "planned the app" in text
-    assert render_memory("", {}, []) == ""  # empty memory renders nothing
+    # Empty memory renders nothing.
+    assert asyncio.run(render_memory(config(), LedgerState(), [], None, "", None, 4000)) == ""
 
 
 # -- v2 CRS dynamics ----------------------------------------------------------
@@ -641,8 +667,6 @@ def test_cued_recall_survives_chatty_cue_live_repro():
 
 
 def test_render_memory_thread_gating():
-    from server.mind.assembler import ThreadsView, render_memory
-
     aside = make_thread(
         "dumpling-aside",
         "Plum dumpling trick.",
@@ -659,7 +683,7 @@ def test_render_memory_thread_gating():
     }
     logging = make_thread("logging-pipeline", "Vector to Loki pipeline.", activation=0.9)
     view = ThreadsView(admitted=[logging], cued=[], all_keys={"logging-pipeline", "dumpling-aside"})
-    text = render_memory("", records, [], view)
+    text = asyncio.run(render_memory(config(), ledger_state(records), [], view, "", None, 4000))
     assert "log_volume" in text                       # admitted thread's fact renders
     assert "threadless: always renders" in text       # no thread -> safe fallback
     assert "semolina" not in text                     # dormant thread's fact gated out
@@ -668,22 +692,29 @@ def test_render_memory_thread_gating():
 
     # Cue the aside back in: fact returns under the Recalled section.
     view = ThreadsView(admitted=[logging], cued=[aside], all_keys={"logging-pipeline", "dumpling-aside"})
-    text = render_memory("", records, [], view)
+    text = asyncio.run(render_memory(
+        config(), ledger_state(records), [], view, "semolina flour", None, 4000,
+    ))
     assert "Recalled" in text and "semolina not flour" in text
 
 
 def test_store_threads_versioning_and_fork(store):
     sid = store.create_session(None)
     store.append_event(sid, user("q1"), source="client")
-    store.replace_threads(sid, [{"key": "alpha", "summary": "one"}], provenance_seq=1)
-    store.replace_threads(
-        sid,
-        [{"key": "alpha", "summary": "updated"}, {"key": "beta", "summary": "two"}],
-        provenance_seq=1,
-    )
-    live = store.live_threads(sid)
-    assert {t["key"] for t in live} == {"alpha", "beta"}
-    assert [t["summary"] for t in live if t["key"] == "alpha"] == ["updated"]
+    store.append_event(sid, user("q2"), source="client")
+    store.append_fold(sid, 1, 1, [
+        {"op": "thread", "name": "alpha", "summary": "one"},
+    ], "")
+    # A second fold over the SAME span is refused (two stewards must never
+    # both commit the same events); the next span is fine.
+    assert store.append_fold(sid, 1, 1, [], "dup") is None
+    store.append_fold(sid, 2, 2, [
+        {"op": "thread", "id": "t1", "summary": "updated"},
+        {"op": "thread", "name": "beta", "summary": "two"},
+    ], "")
+    live = replay(store.live_folds(sid)).threads
+    assert {t.name for t in live.values()} == {"alpha", "beta"}
+    assert live["t1"].data["summary"] == "updated"
 
     store.set_dynamics(sid, "alpha", 0.7, 0.4, updated_seq=1)
     store.set_dynamics(sid, "alpha", 0.6, 0.41, updated_seq=2)  # upsert, not append
@@ -693,7 +724,8 @@ def test_store_threads_versioning_and_fork(store):
     for i in range(2, 6):
         store.append_event(sid, user(f"q{i}"), source="client")
     store.supersede_from(sid, from_seq=1, by_seq=5)
-    assert store.live_threads(sid) == []
+    assert replay(store.live_folds(sid)).threads == {}
+    assert store.get_dynamics(sid) == {}
 
 
 def test_steward_chunks_oversized_folds(store):
@@ -720,8 +752,7 @@ def test_steward_chunks_oversized_folds(store):
                     {
                         "message": {
                             "content": (
-                                '{"threads": [], "facts": [{"subject": "s", "claim": "c"}],'
-                                ' "decisions": [], "commitments": [],'
+                                '{"ops": [{"op": "add", "kind": "fact", "subject": "s", "claim": "c"}],'
                                 ' "episode": "things happened"}'
                             )
                         }
@@ -734,11 +765,11 @@ def test_steward_chunks_oversized_folds(store):
     assert len(calls) > 1  # ~12*300 est tokens vs 900 cap -> several passes
     for content in calls:
         # No single pass may carry more transcript than roughly the cap.
-        transcript = content.split("New turns:\n", 1)[1]
+        transcript = content.split("NEW TURNS:\n", 1)[1]
         assert len(transcript) // 4 < 900 + 400  # cap + one-event slack
-    episodes = store.live_episodes(sid)
-    assert len(episodes) == len(calls)
-    assert episodes[-1][1] == 12  # watermark reached the requested boundary
+    folds = store.live_folds(sid)
+    assert len(folds) == len(calls)
+    assert folds[-1]["span_to"] == 12  # watermark reached the requested boundary
 
 
 # -- v3: recall + tool router -------------------------------------------------
@@ -830,7 +861,7 @@ def test_prepare_scopes_tools_and_offers_recall(store, tmp_path):
 
         # Simulate folded material: summary watermark present.
         runtime.store.append_event(prepared.session_id, assistant("plan drafted"), source="mind")
-        runtime.store.append_summary(prepared.session_id, 1, "earlier stuff")
+        runtime.store.append_fold(prepared.session_id, 1, 1, [], "earlier stuff")
         transcript += [assistant("plan drafted"), user("now check the beds status")]
         prepared2 = await runtime.prepare(transcript, provider=None, model="m", tools=TOOLBELT)
         names = [t["function"]["name"] for t in prepared2.tools]
@@ -859,7 +890,7 @@ def test_stale_tool_payloads_render_as_digests(store):
     store.append_event(session, user("and now a new question"), source="client")
     events = store.live_events(session)
 
-    workspace = assemble(cfg, None, events, (0, ""))
+    workspace = assemble(cfg, None, events)
     tool_messages = [m for m in workspace.messages if m.get("role") == "tool"]
     assert tool_messages, "stale tool message still present as a digest"
     assert len(tool_messages[0]["content"]) < 600
@@ -883,7 +914,7 @@ def test_current_turn_tool_payload_stays_verbatim(store):
     store.append_event(session, {"role": "tool", "tool_call_id": "c1", "content": payload}, source="client")
     events = store.live_events(session)
 
-    workspace = assemble(cfg, None, events, (0, ""))
+    workspace = assemble(cfg, None, events)
     tool_messages = [m for m in workspace.messages if m.get("role") == "tool"]
     # In-flight exchange: the model needs the full payload to answer NOW.
     assert tool_messages and tool_messages[0]["content"] == payload
@@ -905,7 +936,7 @@ def test_no_digestion_without_budget_pressure(store):
     store.append_event(session, user("next question"), source="client")
     events = store.live_events(session)
 
-    workspace = assemble(cfg, None, events, (0, ""))
+    workspace = assemble(cfg, None, events)
     tool_messages = [m for m in workspace.messages if m.get("role") == "tool"]
     # Everything fits at 8k: the stale payload must stay verbatim (s2-t5's
     # evidence must not be digested when the budget could carry it).
@@ -955,7 +986,7 @@ def test_gap_marker_rendered_on_user_turn(store):
     store.append_event(session, user("ok I'm back"), source="client", ts=t0 + 14400)
     events = store.live_events(session)
 
-    workspace = assemble(cfg, None, events, None, now=t0 + 14400)
+    workspace = assemble(cfg, None, events, now=t0 + 14400)
     back = [m for m in workspace.messages if m.get("role") == "user"][-1]
     assert back["content"].startswith(
         "[4 hours pass — it is now Saturday 2026-03-14 14:26]\n\n"
@@ -972,15 +1003,13 @@ def test_no_gap_marker_below_threshold(store):
     store.append_event(session, user("second, five minutes later"), source="client", ts=1300.0)
     events = store.live_events(session)
 
-    workspace = assemble(cfg, None, events, None, now=1300.0)
+    workspace = assemble(cfg, None, events, now=1300.0)
     contents = [m["content"] for m in workspace.messages if m.get("role") == "user"]
     assert not any(content.startswith("[") for content in contents)
 
 
 def test_now_section_and_due_status():
     from datetime import datetime
-
-    from server.mind.assembler import render_memory
 
     now = datetime(2026, 3, 14, 14, 26).timestamp()
     records = {
@@ -1001,34 +1030,32 @@ def test_now_section_and_due_status():
             },
         ]
     }
-    text = render_memory("", records, [], now=now)
+    text = asyncio.run(render_memory(config(), ledger_state(records), [], None, "", None, 4000, now=now))
     assert "### Now" in text and "Saturday 2026-03-14 14:26" in text
     assert "OVERDUE by 2.4 hours" in text and "raise this NOW" in text
     assert "due Saturday 2026-03-14 18:00 (in 3.6 hours)" in text
     # Garbage due values degrade to the plain trigger, never crash.
     records["commitment"][0]["due"] = "when the cows come home"
-    assert "punch down the dough" in render_memory("", records, [], now=now)
+    assert "punch down the dough" in asyncio.run(render_memory(
+        config(), ledger_state(records), [], None, "", None, 4000, now=now,
+    ))
 
 
 def test_no_clock_renders_no_time_surfaces():
-    from server.mind.assembler import render_memory
-
     records = {
         "commitment": [
             {"actor": "user", "statement": "x", "due": "2026-03-14T12:03", "status": "open"}
         ]
     }
-    text = render_memory("", records, [], now=None)
+    text = asyncio.run(render_memory(config(), ledger_state(records), [], None, "", None, 4000))
     assert "### Now" not in text and "OVERDUE" not in text
 
 
 def test_fresh_session_gets_bare_time_line_not_memory_theater():
     from datetime import datetime
 
-    from server.mind.assembler import MIND_HEADER, render_memory
-
     now = datetime(2026, 3, 14, 14, 26).timestamp()
-    text = render_memory("", {}, [], now=now)
+    text = asyncio.run(render_memory(config(), LedgerState(), [], None, "", None, 4000, now=now))
     assert text == "Current time: Saturday 2026-03-14 14:26."
     assert MIND_HEADER not in text
 

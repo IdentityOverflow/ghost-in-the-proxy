@@ -1,9 +1,9 @@
 from pydantic import BaseModel
 import os, json
-from dotenv import load_dotenv
+from .env import load_env
 
-# Load environment variables from .env file
-load_dotenv()
+# ghost.env (committed defaults) + .env (local overrides); see server/env.py
+load_env()
 
 
 class Settings(BaseModel):
@@ -19,6 +19,8 @@ class Settings(BaseModel):
 
     openrouter_base_url: str | None = os.getenv("OPENROUTER_BASE_URL")
     openrouter_api_key: str | None = os.getenv("OPENROUTER_API_KEY")
+    # JSON merged under every OpenRouter request, e.g. {"reasoning":{"enabled":false}}
+    openrouter_extra_body: dict = json.loads(os.getenv("OPENROUTER_EXTRA_BODY", "{}"))
 
 
     azure_openai_base_url: str | None = os.getenv("AZURE_OPENAI_BASE_URL")
@@ -27,6 +29,11 @@ class Settings(BaseModel):
 
 
     lmstudio_base_url: str | None = os.getenv("LMSTUDIO_BASE_URL")
+    # JSON merged under every LM Studio request. {"reasoning_effort":"none"}
+    # is what actually switches thinking off for API calls on reasoning
+    # models (measured on gemma-4-12b: 190 -> 12 completion tokens for a
+    # one-line answer; the UI toggle does not apply to the API).
+    lmstudio_extra_body: dict = json.loads(os.getenv("LMSTUDIO_EXTRA_BODY", "{}"))
     ollama_base_url: str | None = os.getenv("OLLAMA_BASE_URL")
 
     # When set, replaces the client's system prompt for every request.

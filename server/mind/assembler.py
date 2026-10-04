@@ -1,77 +1,31 @@
-"""Naive v0 workspace assembler: system core + running summary + recent texture.
+"""Workspace assembler: system core + bounded memory + recent texture.
 
-Budget model (docs/architecture.md): reserve is a fraction of the window,
-the summary section is capped, and texture (recent verbatim messages) fills
-the remainder newest-first without splitting tool blocks. Older live events
-must be covered by the running summary before they can be evicted from
-texture — the summarizer guarantees that ordering.
+Budget model (docs/architecture.md, docs/memory-v6.md §3): the reply reserve
+is a fraction of the window; the workspace budget is what remains, capped so
+a huge window cannot reintroduce transcript stuffing; the memory section is
+rendered elsewhere under its own budget (memory_view.py) and handed in as
+text; texture (recent verbatim messages) fills the remainder newest-first
+without splitting tool blocks.
+
+Older live events should be covered by a fold before they leave texture, so
+texture extends backward over budget while coverage catches up — but only
+up to the HARD limit. Past it, truth-in-view loses to not-dying: uncovered
+events are evicted anyway (they stay in the raw store, reachable by recall
+and auto-cue, and the pending fold will cover them).
 """
 
 import json
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
 from typing import Any
 
 from .config import MindConfig
-from .dynamics import ThreadState
+from .memory_view import ThreadsView, format_clock, format_gap  # noqa: F401 (re-exported)
 from .store import Event, content_text
 
-
-@dataclass
-class ThreadsView:
-    """Attention state the runtime computed for this request (v2 CRS).
-
-    Facts attached to a thread render only while that thread is admitted or
-    cued — salience decides, the assembler only enforces. Facts whose thread
-    key is unknown (or absent) always render: a steward that proposes no
-    threads degrades exactly to v1 behavior, never to silence.
-    """
-
-    admitted: list[ThreadState] = field(default_factory=list)
-    cued: list[ThreadState] = field(default_factory=list)
-    all_keys: set[str] = field(default_factory=set)
-
-MIND_HEADER = (
-    "## Conversation memory\n"
-    "You have a persistent memory of this conversation. Earlier turns are "
-    "condensed below; recent turns follow verbatim. Treat these records as "
-    "true history you remember, and obey their status labels:\n"
-    "- When asked what is open, outstanding, or left to do, the 'Open "
-    "commitments' list IS the answer — lead with those items. If you add "
-    "anything beyond them, you MUST label it as a new suggestion, never as "
-    "something already agreed or discussed.\n"
-    "- A decision marked LEANING is NOT decided. Never say 'we decided' "
-    "about it; say it is still open.\n"
-    "- When asked for a status, recap, or summary, name the concrete items "
-    "from these records with their true status (decided vs still open) — "
-    "not vague phrases like 'finalizing the architecture'.\n"
-    "- Never invent decisions, agreements, or tracked items that are not in "
-    "these records or the recent turns."
-)
-
-
-def format_clock(ts: float) -> str:
-    return datetime.fromtimestamp(ts).strftime("%A %Y-%m-%d %H:%M")
-
-
-def format_gap(seconds: float) -> str:
-    if seconds < 3600:
-        return f"{max(1, round(seconds / 60))} minutes"
-    if seconds < 48 * 3600:
-        hours = seconds / 3600
-        return f"{hours:.1f}".rstrip("0").rstrip(".") + " hours"
-    return f"{seconds / 86400:.1f}".rstrip("0").rstrip(".") + " days"
-
-
-def _parse_due(value: Any) -> float | None:
-    """Steward-proposed due datetimes are ISO strings; garbage parses to None."""
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(str(value).strip()).timestamp()
-    except ValueError:
-        return None
-
+# chars/4 undercounts real tokenizers (~20-25% measured on gemma via LM
+# Studio usage). Until a session has calibrated itself from the backend's
+# reported usage, assume this many real tokens per estimated token.
+DEFAULT_TOKEN_SCALE = 1.33
 
 DIGEST_NOTICE = (
     "NOTE: some earlier tool outputs below are shown as truncated digests "
@@ -81,119 +35,22 @@ DIGEST_NOTICE = (
 )
 
 
-RECALLED_SPAN_CHAR_CAP = 400
-
-
-def render_memory(
-    summary_text: str,
-    records: dict[str, list[dict[str, Any]]],
-    episodes: list[tuple[int, int, str]],
-    threads: ThreadsView | None = None,
-    now: float | None = None,
-    recalled_spans: list | None = None,
-) -> str:
-    """Render the structured ledger + episodes (+ prose fallback) as the
-    memory section of the system prompt. Empty sections are omitted. With a
-    clock but no memory yet (fresh session), only a bare time line renders —
-    the memory framing would be a lie on turn one, and noise primes behavior
-    (observed: an s2 model exploring the environment instead of acting)."""
-    sections: list[str] = []
-    if threads and threads.admitted:
-        lines = []
-        for thread in threads.admitted:
-            lines.append(f"- {thread.key}: {thread.summary}")
-            for question in thread.open_questions:
-                lines.append(f"  - open question: {question}")
-        sections.append("### Active threads (what is currently in play)\n" + "\n".join(lines))
-    decisions = records.get("decision", [])
-    if decisions:
-        lines = []
-        for item in decisions:
-            status = str(item.get("status", "open")).upper()
-            if status == "LEANING":
-                status = "LEANING (not yet decided)"
-            reason = f" (reason: {item['reason']})" if item.get("reason") else ""
-            lines.append(f"- {item.get('topic')}: {status} — {item.get('choice', '')}{reason}")
-        sections.append("### Decisions\n" + "\n".join(lines))
-    commitments = records.get("commitment", [])
-    open_commitments = [c for c in commitments if c.get("status", "open") == "open"]
-    if open_commitments:
-        lines = []
-        for item in open_commitments:
-            line = f"- ({item.get('actor', 'user')}) {item.get('statement')}"
-            if item.get("trigger"):
-                line += f" — trigger: {item['trigger']}"
-            due = _parse_due(item.get("due")) if now is not None else None
-            if due is not None:
-                if now >= due:
-                    line += (
-                        f" — was due {format_clock(due)}, OVERDUE by "
-                        f"{format_gap(now - due)}: raise this NOW"
-                    )
-                else:
-                    line += f" — due {format_clock(due)} (in {format_gap(due - now)})"
-            lines.append(line)
-        sections.append("### Open commitments (complete list of tracked items)\n" + "\n".join(lines))
-    facts = records.get("fact", [])
-    if threads is not None:
-        visible_keys = {thread.key for thread in threads.admitted}
-        facts = [
-            item
-            for item in facts
-            if item.get("thread") not in threads.all_keys or item.get("thread") in visible_keys
-        ]
-    if facts:
-        lines = [f"- {item.get('subject')}: {item.get('claim')}" for item in facts]
-        sections.append("### Facts\n" + "\n".join(lines))
-    if threads and threads.cued:
-        lines = []
-        for thread in threads.cued:
-            lines.append(f"- {thread.key}: {thread.summary}")
-            for fact in thread.facts:
-                lines.append(f"  - {fact.get('subject')}: {fact.get('claim')}")
-        sections.append(
-            "### Recalled (dormant memory cued by the latest message)\n" + "\n".join(lines)
-        )
-    if recalled_spans:
-        # Raw-memory rescue (s13): folded verbatim spans the Mem backend
-        # matched semantically. Provenance-marked and pointed — the baseline
-        # failed with the same material merely present in context.
-        lines = []
-        for span in sorted(recalled_spans, key=lambda s: s.seq):
-            text = span.text
-            if len(text) > RECALLED_SPAN_CHAR_CAP:
-                text = text[:RECALLED_SPAN_CHAR_CAP] + " …[truncated]"
-            # seq provenance rendered on purpose: order questions are only
-            # answerable if the model can SEE the sequence numbers.
-            lines.append(f"- [seq {span.seq}, verbatim] {span.role}: {text}")
-        sections.append(
-            "### Recalled verbatim (raw memory matched to the latest message)\n"
-            + "\n".join(lines)
-        )
-    if episodes:
-        lines = [f"- {summary}" for _, _, summary in episodes]
-        sections.append("### Earlier events\n" + "\n".join(lines))
-    if summary_text:
-        sections.append("### Earlier conversation (condensed)\n" + summary_text)
-    if not sections:
-        return f"Current time: {format_clock(now)}." if now is not None else ""
-    if now is not None:
-        sections.insert(
-            0,
-            "### Now\n"
-            f"Current time: {format_clock(now)} — the time AS OF the user's "
-            "latest message (any elapsed-time markers in the conversation are "
-            "already counted into it; never add them on top). Use it for any "
-            "question about time, duration, or how long the user was away, "
-            "and check open commitments' due times against it.",
-        )
-    return MIND_HEADER + "\n\n" + "\n\n".join(sections)
+class WorkspaceOverflow(Exception):
+    """The request cannot be made to fit the window by any safe eviction or
+    truncation (a huge client system prompt, giant tool-call arguments).
+    Surfaced to the client as a context-length error: silently sending it
+    would either fail at the backend or be truncated there — the
+    confabulation source the mind exists to remove."""
 
 
 def estimate_tokens(payload: Any) -> int:
-    if isinstance(payload, str):
-        return max(1, len(payload) // 4)
-    return max(1, len(json.dumps(payload, ensure_ascii=False)) // 4)
+    """Cheap token estimate. ~4 chars/token holds for English prose; text
+    outside ASCII (CJK, Cyrillic, emoji) runs far denser, up to a token per
+    character, so it is counted separately — a first request in Chinese must
+    not look four times smaller than it is. Calibration refines the rest."""
+    text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+    dense = sum(1 for char in text if ord(char) > 0x2FF)
+    return max(1, (len(text) - dense) // 4 + int(dense * 0.8))
 
 
 @dataclass
@@ -202,6 +59,15 @@ class Workspace:
     texture_from_seq: int  # first live seq actually included verbatim
     desired_from_seq: int  # first seq the BUDGET wanted — eviction pressure
     estimated_tokens: int
+    # Telemetry split: the mind's own memory section vs the whole system
+    # message (client prompt + memory) vs the workspace budget it lives in.
+    memory_tokens: int = 0
+    system_tokens: int = 0
+    budget_tokens: int = 0
+    hard_limit_tokens: int = 0
+    # Events evicted by the hard guard before any fold covered them — should
+    # be zero in steady state; nonzero means folding fell behind.
+    evicted_uncovered: int = 0
 
 
 def _texture_blocks(events: list[Event]) -> list[list[Event]]:
@@ -220,37 +86,61 @@ def _texture_blocks(events: list[Event]) -> list[list[Event]]:
     return blocks
 
 
+def token_budgets(config: MindConfig, tools_tokens: int = 0, scale: float = DEFAULT_TOKEN_SCALE) -> tuple[int, int]:
+    """(workspace budget, hard limit), both in ESTIMATED tokens.
+
+    `scale` converts estimates to real tokens (self-calibrated per session
+    from usage.prompt_tokens); tool schemas ride in the same request, so
+    their cost comes off the top. The workspace cap keeps a 128k window from
+    turning back into a transcript dump — what legitimately grows with the
+    window is bounded too, just higher.
+    """
+    reserve = max(int(config.window * config.reserve_fraction), 1024)
+    budget = int((config.window - reserve) / scale) - tools_tokens
+    budget = min(budget, config.workspace_cap_tokens)
+    # Over-budget backward extension may eat half the reply reserve, no more.
+    hard = int((config.window - reserve // 2) / scale) - tools_tokens
+    hard = min(hard, int(config.workspace_cap_tokens * 1.25))
+    return max(budget, 256), max(hard, 512)
+
+
 def assemble(
     config: MindConfig,
     client_system: str | None,
     events: list[Event],
-    summary: tuple[int, str] | None,
-    records: dict[str, list[dict[str, Any]]] | None = None,
-    episodes: list[tuple[int, int, str]] | None = None,
-    threads: ThreadsView | None = None,
+    covered_upto: int = 0,
+    memory_text: str = "",
     now: float | None = None,
-    recalled_spans: list | None = None,
+    tools_tokens: int = 0,
+    scale: float = DEFAULT_TOKEN_SCALE,
+    volatile_text: str = "",
+    fold_boundaries: list[int] | None = None,
+    memory_budget_tokens: int = 0,
 ) -> Workspace:
-    reserve = max(int(config.window * config.reserve_fraction), 1024)
-    # chars/4 underestimates real tokenizers by ~20% (measured against
-    # gemma-3 via LM Studio usage); the safety factor absorbs that.
-    workspace_budget = int((config.window - reserve) * 0.75)
-
+    """`memory_text` rides in the system message; `volatile_text` (per-turn
+    memory, phase A) is prefixed to the latest user message so everything
+    before it stays byte-identical between folds and the backend's prefix
+    cache keeps working."""
+    workspace_budget, hard_limit = token_budgets(config, tools_tokens, scale)
 
     system_parts = []
     if client_system:
         system_parts.append(client_system)
-    summary_upto, summary_text = (summary or (0, ""))
-    memory = render_memory(
-        summary_text, records or {}, episodes or [], threads, now=now,
-        recalled_spans=recalled_spans,
-    )
-    if memory:
-        system_parts.append(memory)
+    if memory_text:
+        system_parts.append(memory_text)
     system_content = "\n\n".join(system_parts)
     system_cost = estimate_tokens(system_content) if system_content else 0
 
-    texture_budget = workspace_budget - system_cost
+    # Texture never gets the memory section's share, even while memory is
+    # still empty. Otherwise the first fold triggers only when texture alone
+    # fills the workspace, and the moment it lands the new memory section
+    # (0 -> ~1.3k tokens) overflows the hard limit: uncovered events are
+    # evicted and a SECOND fold runs synchronously (live: a 169 s turn).
+    memory_now = (estimate_tokens(memory_text) if memory_text else 0) + (
+        estimate_tokens(volatile_text) if volatile_text else 0
+    )
+    unused_memory = max(0, memory_budget_tokens - memory_now)
+    texture_budget = workspace_budget - system_cost - unused_memory
 
     # Containment (v3): under budget pressure, stale tool payloads render as
     # digests — the full text stays in the event store, reachable via recall.
@@ -259,7 +149,7 @@ def assemble(
     # s2-t5 at 4k while the baseline still had the evidence in view).
     render: dict[int, Any] = {event.seq: event.message for event in events}
     candidate_cost = sum(
-        estimate_tokens(event.message) for event in events if event.seq > summary_upto
+        estimate_tokens(event.message) for event in events if event.seq > covered_upto
     )
     if candidate_cost > texture_budget:
         render = _digest_stale_tool_events(config, events)
@@ -267,23 +157,26 @@ def assemble(
     if digested and system_content:
         system_content += "\n\n" + DIGEST_NOTICE
         system_cost = estimate_tokens(system_content)
-        texture_budget = workspace_budget - system_cost
+        texture_budget = workspace_budget - system_cost - unused_memory
 
     # Chronos (v4): real elapsed time between turns renders as an inline
     # marker on the later user message — no role changes, so chat-template
     # alternation is untouched.
     if now is not None:
         render = _mark_gaps(config, events, render)
+    if volatile_text:
+        render = _attach_notes(events, render, volatile_text)
 
     blocks = _texture_blocks(events)
 
-    # Newest blocks first until the budget is spent; never evict events the
-    # summary doesn't cover yet (the summarizer runs before assembly to make
-    # that impossible in steady state), and always include the newest block.
+    def block_cost(block: list[Event]) -> int:
+        return sum(estimate_tokens(render[event.seq]) for event in block)
+
+    # Newest blocks first until the budget is spent; always the newest block.
     chosen: list[list[Event]] = []
     spent = 0
     for block in reversed(blocks):
-        cost = sum(estimate_tokens(render[event.seq]) for event in block)
+        cost = block_cost(block)
         if chosen and spent + cost > texture_budget:
             break
         chosen.append(block)
@@ -298,27 +191,92 @@ def assemble(
         start_index -= 1
         chosen.insert(0, blocks[start_index])
 
+    # desired_from_seq is what the budget selected — the runtime measures
+    # eviction pressure from it. Until a fold covers them, older events stay
+    # in view over budget rather than lose truth (measuring pressure from the
+    # EXTENDED texture would never trigger the fold: the v0 first-run bug).
+    desired_from_seq = chosen[0][0].seq if chosen else 0
+    evicted_uncovered = 0
+    while start_index > 0 and blocks[start_index - 1][-1].seq > covered_upto:
+        start_index -= 1
+        chosen.insert(0, blocks[start_index])
+
+    if fold_boundaries is not None:
+        # The cache contract (phase A): the texture may only START at a fold
+        # boundary. Newest-first filling evicts one covered block per turn —
+        # the prompt's second message changes every turn and the backend's
+        # prefix cache never survives (measured: 13% reuse). Pinning the start
+        # to the earliest fold boundary that fits moves it only when a fold
+        # lands, which is when the system message changes anyway; fold-ahead
+        # leaves the headroom that keeps it still in between.
+        starts = [0] + sorted(boundary for boundary in fold_boundaries if boundary <= covered_upto)
+        for boundary in starts:
+            index = next((i for i, block in enumerate(blocks) if block[0].seq > boundary), len(blocks))
+            candidate = blocks[index:]
+            if not candidate:
+                continue
+            fits = system_cost + unused_memory + sum(block_cost(block) for block in candidate) <= workspace_budget
+            if fits or boundary == starts[-1]:
+                # Every boundary is <= covered_upto, so no uncovered event is
+                # ever dropped here; the last one may run over budget, exactly
+                # like the uncovered extension above.
+                chosen = list(candidate)
+                break
+        while chosen and chosen[0][0].role != "user":
+            index = len(blocks) - len(chosen)
+            if index == 0:
+                break
+            chosen.insert(0, blocks[index - 1])
+
+    # HARD GUARD: the request must fit the window, whatever it costs. Evict
+    # from the old end (keeping the opening on a user block), never the
+    # newest block.
+    def total() -> int:
+        return system_cost + sum(block_cost(block) for block in chosen)
+
+    if total() > hard_limit:
+        # Smallest eviction that fits AND still opens on a user block; if no
+        # user-opening suffix fits, keep the last one and shrink below.
+        openers = [index for index, block in enumerate(chosen) if block[0].role == "user"]
+        keep_from = next(
+            (
+                index
+                for index in openers
+                if system_cost + sum(block_cost(block) for block in chosen[index:]) <= hard_limit
+            ),
+            openers[-1] if openers else 0,
+        )
+        for block in chosen[:keep_from]:
+            evicted_uncovered += sum(1 for event in block if event.seq > covered_upto)
+        chosen = chosen[keep_from:]
+
     texture_events = [event for block in chosen for event in block]
-    # desired_from_seq is what the budget selected — the runtime uses it to
-    # measure eviction pressure and trigger summarization. Until coverage
-    # exists, texture extends backward (over budget) rather than lose truth;
-    # measuring pressure from the EXTENDED texture would never trigger the
-    # summarizer (the v0 first-run bug), so the two seqs are kept separate.
-    desired_from_seq = texture_events[0].seq if texture_events else 0
-    if texture_events:
-        uncovered = [
-            event for event in events if summary_upto < event.seq < desired_from_seq
-        ]
-        if uncovered:
-            texture_events = [event for event in events if event.seq > summary_upto]
     # Final alternation guard: whatever path built the texture, it must open
-    # on a user turn (duplicating an already-summarized event is safe; a
+    # on a user turn (duplicating an already-covered event is safe; a
     # template rejection is not).
     while texture_events and texture_events[0].role != "user":
         earlier = [event for event in events if event.seq < texture_events[0].seq]
         if not earlier:
             break
         texture_events.insert(0, earlier[-1])
+
+    # Still over: a single exchange alone overflows (a giant paste or tool
+    # dump in the current turn). Middle-truncate the largest messages in
+    # place until it fits; the store keeps the full text.
+    for _ in range(4):
+        excess = system_cost + sum(estimate_tokens(render[e.seq]) for e in texture_events) - hard_limit
+        if excess <= 0 or not texture_events:
+            break
+        _shrink_block(texture_events, render, excess)
+    final = system_cost + sum(estimate_tokens(render[e.seq]) for e in texture_events)
+    # Small slack: the guard works in estimates, and a few tokens over the
+    # (already conservative) hard limit is not worth failing a request for.
+    if final > hard_limit * 1.03:
+        raise WorkspaceOverflow(
+            f"request needs ~{final} tokens after eviction and truncation; "
+            f"the limit for a {config.window}-token window is ~{hard_limit} "
+            f"(system prompt {system_cost}, tools {tools_tokens})"
+        )
 
     messages: list[dict[str, Any]] = []
     if system_content:
@@ -331,7 +289,46 @@ def assemble(
         desired_from_seq=desired_from_seq,
         estimated_tokens=system_cost
         + sum(estimate_tokens(render[event.seq]) for event in texture_events),
+        memory_tokens=(estimate_tokens(memory_text) if memory_text else 0)
+        + (estimate_tokens(volatile_text) if volatile_text else 0),
+        system_tokens=system_cost,
+        budget_tokens=workspace_budget,
+        hard_limit_tokens=hard_limit,
+        evicted_uncovered=evicted_uncovered,
     )
+
+
+def _shrink_block(block: list[Event], render: dict[int, Any], excess_tokens: int) -> None:
+    """Middle-truncate the largest text message of a block by ~excess tokens.
+    The store keeps the full text; the marker tells the model how to reach it."""
+    largest = max(block, key=lambda event: len(content_text(render[event.seq]) or ""))
+    message = render[largest.seq]
+    text = content_text(message) or ""
+    keep = max(800, len(text) - (excess_tokens + 60) * 4)
+    if keep >= len(text):
+        return
+    head, tail = keep * 2 // 3, keep // 3
+    cut = (
+        f"{text[:head]}\n…[{len(text) - keep} characters omitted here to fit the context window — "
+        f"ask the user to send it in parts, or call recall(...) for a specific passage]…\n{text[-tail:]}"
+    )
+    render[largest.seq] = {**message, "content": cut}
+
+
+def _attach_notes(events: list[Event], render: dict[int, Any], notes: str) -> dict[int, Any]:
+    """Prefix the per-turn memory block to the LATEST user message (render
+    only — the store never sees it, so reconciliation is untouched). During a
+    tool loop the latest user message is unchanged, and so is the block."""
+    target = next((event for event in reversed(events) if event.role == "user"), None)
+    if target is None:
+        return render
+    message = render[target.seq]
+    content = message.get("content")
+    if isinstance(content, str):
+        render[target.seq] = {**message, "content": f"{notes}\n\n{content}"}
+    elif isinstance(content, list):
+        render[target.seq] = {**message, "content": [{"type": "text", "text": notes}] + content}
+    return render
 
 
 def _mark_gaps(
@@ -400,5 +397,3 @@ def _digest_stale_tool_events(config: MindConfig, events: list[Event]) -> dict[i
             )
             render[event.seq] = {**event.message, "content": digest}
     return render
-
-

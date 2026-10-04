@@ -2,6 +2,12 @@
 import os
 from pydantic import BaseModel
 
+from ..env import load_env
+
+# The fields below read os.getenv at class-definition time: the config file
+# must be loaded before that, whoever imports this module first.
+load_env()
+
 
 class MindConfig(BaseModel):
     enabled: bool = os.getenv("MIND_ENABLED", "0") == "1"
@@ -36,6 +42,49 @@ class MindConfig(BaseModel):
     # spans (e.g. the re-fold after a deep fork) are chunked into sequential
     # passes instead of overflowing the extraction model's window.
     steward_input_tokens: int = int(os.getenv("MIND_STEWARD_INPUT_TOKENS", "2600"))
+    # Memory v6: how much of the ledger one steward pass may see (a
+    # relevance-ranked slice, not the whole thing — docs/memory-v6.md §2).
+    steward_slice_tokens: int = int(os.getenv("MIND_STEWARD_SLICE_TOKENS", "1200"))
+    # Ask the backend for JSON-schema constrained decoding on steward calls
+    # (LM Studio, llama.cpp, vLLM, most OpenRouter routes). Backends that
+    # refuse it are remembered and asked for plain JSON instead.
+    steward_json_schema: bool = os.getenv("MIND_STEWARD_JSON_SCHEMA", "1") == "1"
+    # The memory section's share of the workspace budget, with absolute
+    # bounds: small windows still get a usable scene, big windows do not get
+    # a bigger default scene (abundance causes dilution).
+    # Where per-turn memory goes. "split": stable memory in the system
+    # message, per-turn memory (clock, cue-recalled records, active threads)
+    # in a block on the latest user message — the backend's KV cache survives
+    # between folds. "system": everything in the system message (pre-phase-A).
+    memory_placement: str = os.getenv("MIND_MEMORY_PLACEMENT", "split")
+    # Per-turn rhythm note: when the model's own recent replies show a rut
+    # (every reply ending on a question, recycled closing lines), say so in the
+    # notes on the latest user message. See memory_view.style_note.
+    style_nudge: bool = os.getenv("MIND_STYLE_NUDGE", "1") == "1"
+    # Quick thoughts (experimental, server/mind/thoughts.py): comma list of
+    # rhythm | observe | sheet | typed | sketch | sketchlite. Default is the
+    # free combination that won the A/B (docs/quick-thoughts.md): blind
+    # preference 15-5 and 18-1 over the rhythm-only baseline on two scripts,
+    # zero model calls. Add "sketch" for the best-sounding setup at ~+5 s.
+    thoughts: str = os.getenv("MIND_THOUGHTS", "sheet,observe")
+    memory_fraction: float = float(os.getenv("MIND_MEMORY_FRACTION", "0.35"))
+    memory_min_tokens: int = int(os.getenv("MIND_MEMORY_MIN_TOKENS", "900"))
+    memory_max_tokens: int = int(os.getenv("MIND_MEMORY_MAX_TOKENS", "4000"))
+    # Ceiling on the assembled workspace whatever the window (estimated
+    # tokens): a 128k window must not reintroduce transcript stuffing.
+    workspace_cap_tokens: int = int(os.getenv("MIND_WORKSPACE_CAP", "16000"))
+    # Fold in the background after the reply (the next request for the same
+    # session waits for an in-flight fold). 0 = only fold on the request path.
+    background_fold: bool = os.getenv("MIND_BACKGROUND_FOLD", "1") == "1"
+    # How long a request waits for an in-flight background pass before going
+    # ahead without it (the hard guard keeps the request valid; the pass
+    # lands for the next turn). A slow or rate-limited extraction backend
+    # must never hang the conversation. Eval runs set it high: waiting makes
+    # fold timing deterministic.
+    maintenance_wait_s: float = float(os.getenv("MIND_MAINTENANCE_WAIT_S", "60"))
+    # Consolidate leaf episodes into era lines once this many are older than
+    # the recent tail; this many eras fold into an epoch.
+    era_size: int = int(os.getenv("MIND_ERA_SIZE", "6"))
     # Model used for summarization/extraction; empty = the request's model.
     extraction_model: str | None = os.getenv("MIND_EXTRACTION_MODEL") or None
     # Hard cap on extraction-call output (steward/summarizer). Roomy enough

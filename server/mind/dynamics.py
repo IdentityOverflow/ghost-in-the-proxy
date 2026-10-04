@@ -31,7 +31,8 @@ STOPWORDS = frozenset(
     would""".split()
 )
 
-_WORD = re.compile(r"[a-zA-Z][a-zA-Z0-9_-]+")
+# Unicode letters: lexical relevance must not be English-only.
+_WORD = re.compile(r"[^\W\d_][\w-]*")
 
 
 def tokenize(text: str) -> set[str]:
@@ -43,7 +44,9 @@ def tokenize(text: str) -> set[str]:
     tokens = set()
     for word in _WORD.findall(text.lower().replace("'", " ")):
         word = word.strip("-")
-        if word in STOPWORDS or len(word) < 3:
+        # Scripts without spaces/with dense words (CJK names are two
+        # characters) would all fall under an ASCII-sized length floor.
+        if word in STOPWORDS or len(word) < (3 if word.isascii() else 2):
             continue
         if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
             word = word[:-1]
@@ -69,10 +72,17 @@ class ThreadState:
     activation: float = 0.6  # fresh threads start admitted, then must earn it
     importance: float = 0.3
     facts: list[dict[str, Any]] = field(default_factory=list)  # attached ledger facts
+    # Human-readable slug. Since memory v6 `key` is a runtime id ("t3"); the
+    # name is what renders and what carries lexical signal.
+    name: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            self.name = self.key
 
     def tokens(self) -> set[str]:
         text = " ".join(
-            [self.key.replace("-", " "), self.summary, " ".join(self.anchors)]
+            [self.name.replace("-", " "), self.summary, " ".join(self.anchors)]
             + [str(fact.get("subject", "")) + " " + str(fact.get("claim", "")) for fact in self.facts]
         )
         return tokenize(text)

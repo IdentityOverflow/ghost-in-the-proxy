@@ -25,6 +25,7 @@ conversation scale (thousands of events × 1024 dims) a matmul is
 sub-millisecond; a vector-db dependency would be decoration.
 """
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -73,6 +74,11 @@ class MemBackend(Protocol):
     async def boundary(self, session_id: str, reason: str, upto_seq: int) -> None:
         """An episode boundary: a fold happened or a thread went dormant."""
 
+    async def text_sims(self, query: str, texts: list[str]) -> list[float] | None:
+        """Semantic similarity of `query` to each of `texts` (derived memory:
+        ledger records, episodes). None = this backend has no semantic
+        signal; callers fall back to lexical relevance alone."""
+
     async def query(self, session_id: str, query: MemQuery, events: list[Event]) -> list[MemSpan]:
         """Resolve a cue against this session's raw memory.
 
@@ -100,6 +106,9 @@ class LexicalMem:
 
     async def boundary(self, session_id: str, reason: str, upto_seq: int) -> None:
         pass
+
+    async def text_sims(self, query: str, texts: list[str]) -> list[float] | None:
+        return None
 
     async def query(self, session_id: str, query: MemQuery, events: list[Event]) -> list[MemSpan]:
         if query.kind != "content":
@@ -138,6 +147,10 @@ class EmbeddingMem:
         self.store = store
         self._lexical = LexicalMem()
         self._client: httpx.AsyncClient | None = None
+        # seqs already embedded, per session, loaded lazily from the store:
+        # after a restart the runtime re-observes every live event, and
+        # without this each one cost an embedding call before the first reply.
+        self._embedded: dict[str, set[int]] = {}
 
     async def _embed(self, texts: list[str]) -> list[np.ndarray] | None:
         try:
@@ -160,12 +173,42 @@ class EmbeddingMem:
         text = (content_text(event.message) or "").strip()
         if not text:
             return
+        known = self._embedded.get(session_id)
+        if known is None:
+            known = {seq for seq, _ in self.store.get_embeddings(session_id, self.config.embed_model)}
+            self._embedded[session_id] = known
+        if event.seq in known:
+            return
         vecs = await self._embed([text[:EMBED_INPUT_CHAR_CAP]])
         if vecs:
             self.store.put_embedding(session_id, event.seq, self.config.embed_model, vecs[0].tobytes())
+            known.add(event.seq)
 
     async def boundary(self, session_id: str, reason: str, upto_seq: int) -> None:
         pass
+
+    async def text_sims(self, query: str, texts: list[str]) -> list[float] | None:
+        """Cosine of the query against derived-memory texts. Vectors are
+        cached by content hash, so a ledger record is embedded once in its
+        life and the steady-state cost per turn is one query embedding."""
+        if not texts or not query.strip():
+            return None
+        model = self.config.embed_model
+        hashes = [hashlib.sha1(text.encode("utf-8")).hexdigest() for text in texts]
+        cached = self.store.get_cached_vectors(model, hashes)
+        missing = [(h, t) for h, t in dict(zip(hashes, texts)).items() if h not in cached]
+        need = [query[:EMBED_INPUT_CHAR_CAP]] + [t[:EMBED_INPUT_CHAR_CAP] for _, t in missing]
+        vecs = await self._embed(need)
+        if vecs is None or len(vecs) != len(need):
+            return None
+        fresh = {h: vec.tobytes() for (h, _), vec in zip(missing, vecs[1:])}
+        if fresh:
+            self.store.put_cached_vectors(model, fresh)
+            cached.update(fresh)
+        matrix = np.stack([np.frombuffer(cached[h], dtype=np.float32) for h in hashes])
+        qvec = vecs[0]
+        norms = np.linalg.norm(matrix, axis=1) * (np.linalg.norm(qvec) + 1e-9)
+        return [float(score) for score in (matrix @ qvec) / np.maximum(norms, 1e-9)]
 
     async def query(self, session_id: str, query: MemQuery, events: list[Event]) -> list[MemSpan]:
         if query.kind == "next":

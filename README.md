@@ -11,21 +11,23 @@ It measurably improves small models at small windows — the founding result: ge
 | organ | job |
 |---|---|
 | **Perception** | Diffs each incoming transcript against the event store: continue, fork (edited message), regenerate, or stop-button truncation — real client behaviors, all first-class. The transcript is evidence, never memory. |
-| **Steward** | An LLM extraction pass at fold time proposes the complete updated ledger — facts, decisions with status, commitments with triggers — plus thread structure and an episode line. The runtime applies it deterministically; the LLM only proposes. |
+| **Steward** | An LLM extraction pass at fold time proposes small *operations* against runtime-issued ids — add / update / close on facts, decisions with status, commitments with triggers, plus thread upserts and one episode line — over a relevance-ranked slice of the ledger. The runtime validates per-op and applies deterministically; the LLM only proposes, and what it does not mention cannot change. |
+| **Fold log + consolidation** | Every fold is one immutable row; ledger state is a pure replay of the live rows, so fork/regenerate restore is a query. In the background (the idle loop), aged episode lines condense once into era lines, eras into epochs — O(log n) rewrites per text, leaves never deleted. |
 | **CRS dynamics** | Threads carry activation (fast decay, λ≈0.85) and importance (slow). Activation gates workspace admission: dormant material leaves the context entirely, and a lexical cue reinjects it. Forgetting is not deletion. |
-| **Workspace assembler** | Builds the model's context in fixed order — client system prompt, memory sections with true status labels, recent turns verbatim — under a hard budget (~25% reserve, flat curve). Abundance causes dilution; the scene stays small on purpose. |
+| **Workspace assembler** | Builds the model's context in fixed order — client system prompt, a *bounded* memory section (tiers under a token budget: commitments, always-true profile, decisions, active threads, cue-recalled records, episodes), recent turns verbatim — under a hard window guard, with a workspace cap so a 128k window does not reintroduce stuffing. The token estimate self-calibrates from the backend's reported usage. Abundance causes dilution; the scene stays small on purpose. |
 | **Recall** | The provenance escape hatch: a proxy-side tool over the raw event store. When the model needs exact wording that folded away, it reaches back and gets the verbatim span. Invisible to the client, on streamed and non-streamed requests alike (pure recall replies are held back, resolved, and re-queried mid-stream). |
 | **Raw memory (Mem)** | A pluggable cue→episode backend over the raw events. Default is the lexical search; `MIND_MEM_BACKEND=embedding` adds semantic vectors (bge-m3 class) hybrid-scored with the lexical signals — and an auto-cue channel that pushes folded, semantically-matched verbatim spans into the workspace each turn, seq-tagged. Built because evals showed distillation drops exactly the mundane one-shot details real questions come back for. |
 | **Router + containment** | The client's tool belt is scoped per turn (schema bulk is context tax), and stale tool payloads compress to digests under budget pressure — verbatim first, recall always available. |
+| **Quick thoughts** (experimental) | What pops into mind before a reply: a short "how to talk" sheet plus per-turn, machine-made observations of the model's own habits ("your last five replies were all ~100 words — make this one shorter"), optionally a sketch of three possible moves with a pick. Aimed at sounding like a person, not at being smarter: blind preference 15–5 and 18–1 over the baseline on a 12B model, at zero added latency. See [`docs/quick-thoughts.md`](docs/quick-thoughts.md). |
 | **Chronos** | Wall-clock time as a first-class input: the workspace carries the current time, real elapsed-time markers between turns ("[4 hours pass — it is now …]"), and due/OVERDUE status on time-triggered commitments — the steward converts "in two hours" to an absolute datetime at extraction. A transcript cannot carry any of this: the client protocol transmits no clock. |
 
 Everything derived is append-only and provenance-stamped; corrections are supersede links. State at any point in the conversation is a query, which is what makes fork/regenerate/interrupt a reconciliation step instead of a feature.
 
-See [`docs/architecture.md`](docs/architecture.md) for the full design and the phased eval gates (v0 skeleton → v1 ledger → v2 dynamics → v3 recall/routing/containment → v4 chronos → v5 Mem socket). Every phase ships only after a scenario that *fails without it* starts passing — and the suite has twice returned a verdict of "don't build it": the semantic-callback scenario showed distillation already covers paraphrased recall of memorable asides, and the holographic-reel backend was retired when embeddings plus log order passed every retrieval gate it would have claimed.
+See [`docs/architecture.md`](docs/architecture.md) for the full design, and [`docs/memory-v6.md`](docs/memory-v6.md) for the endless-conversation memory layer (why the v1 ledger degraded past ~20 turns, and what replaced it). The rest of this paragraph covers the design and the phased eval gates (v0 skeleton → v1 ledger → v2 dynamics → v3 recall/routing/containment → v4 chronos → v5 Mem socket). Every phase ships only after a scenario that *fails without it* starts passing — and the suite has twice returned a verdict of "don't build it": the semantic-callback scenario showed distillation already covers paraphrased recall of memorable asides, and the holographic-reel backend was retired when embeddings plus log order passed every retrieval gate it would have claimed.
 
 ## The eval suite
 
-`evals/` contains a 13-scenario harness that plays scripted multi-turn conversations as a real client (full transcript resent every turn) against any OpenAI-compatible endpoint, and grades probes deterministically plus with an optional LLM judge (majority-of-N voting). Scenarios cover decision coherence, tool-heavy synthesis, delayed commitment triggers, contradiction handling, salience decay with cued recall, containment, fork/regenerate continuity, mid-reply interrupts, verbatim recall, tool-schema tax, time awareness across real gaps (a virtual clock advances per turn via the `X-Mind-Clock` header, honored only with `MIND_FAKE_CLOCK=1`), zero-word-overlap semantic callbacks, and dropped-detail + incidental-order recall. `--stream` runs the whole suite over SSE (usage measured via `stream_options`); `evals/regrade.py` re-scores stored replies after rubric fixes without re-sampling.
+`evals/` contains a 13-scenario harness (plus the opt-in 160-turn `s14-soak`, with `evals/soak_report.py` joining its results to the mind's `MIND_METRICS_PATH` telemetry) that plays scripted multi-turn conversations as a real client (full transcript resent every turn) against any OpenAI-compatible endpoint, and grades probes deterministically plus with an optional LLM judge (majority-of-N voting). Scenarios cover decision coherence, tool-heavy synthesis, delayed commitment triggers, contradiction handling, salience decay with cued recall, containment, fork/regenerate continuity, mid-reply interrupts, verbatim recall, tool-schema tax, time awareness across real gaps (a virtual clock advances per turn via the `X-Mind-Clock` header, honored only with `MIND_FAKE_CLOCK=1`), zero-word-overlap semantic callbacks, and dropped-detail + incidental-order recall. `--stream` runs the whole suite over SSE (usage measured via `stream_options`); `evals/regrade.py` re-scores stored replies after rubric fixes without re-sampling.
 
 ```bash
 # baseline (direct to your backend)
@@ -41,13 +43,21 @@ python -m evals.run --base-url http://127.0.0.1:8000/v1 --model <model> --label 
 
 ```bash
 pip install -r server/requirements.txt
-MIND_ENABLED=1 MIND_WINDOW=8192 DEFAULT_PROVIDER=lmstudio LMSTUDIO_BASE_URL=http://localhost:1234 \
-  uvicorn server.main:app --host 0.0.0.0 --port 8000
+uvicorn server.main:app --port 8000
 ```
 
-Point any OpenAI-compatible client at it. With `MIND_ENABLED` unset the server is a faithful passthrough (that bare proxy lives on as its own project: [LLM-passthrough-endpoint](https://github.com/IdentityOverflow/LLM-passthrough-endpoint)).
+That is the whole command: [`ghost.env`](ghost.env) is the committed config file, and its defaults start the mind against a local LM Studio (`http://127.0.0.1:1234`, 8k window, bge-m3 embeddings, reasoning off). Edit it, or override per machine in a gitignored `.env` (API keys go there); anything exported in the shell wins over both. `GHOST_CONFIG=path` selects a different file.
 
-Key environment variables (see `server/mind/config.py` for all):
+Point any OpenAI-compatible client at `http://localhost:8000/v1`. With `MIND_ENABLED=0` the server is a faithful passthrough (that bare proxy lives on as its own project: [LLM-passthrough-endpoint](https://github.com/IdentityOverflow/LLM-passthrough-endpoint)).
+
+To feel it as a user — a file-backed chat client that resends the full transcript each turn and records time-to-first-token:
+
+```bash
+python -m evals.livechat --session me "Hi, I'm planning a garden."
+python -m evals.livechat --session me --stats
+```
+
+Key settings (all in `ghost.env`; see `server/mind/config.py` for every knob):
 
 | variable | default | meaning |
 |---|---|---|
@@ -61,6 +71,13 @@ Key environment variables (see `server/mind/config.py` for all):
 | `MIND_EMBED_BASE_URL` / `MIND_EMBED_MODEL` | `http://localhost:1234/v1` / `text-embedding-bge-m3` | OpenAI-compatible embeddings endpoint for the embedding backend |
 | `MIND_EMBED_MIN_SIM` | `0.45` | cosine floor for semantic-only hits and auto-cue injection |
 | `MIND_DB_DIR` | `var/minds` | SQLite event stores (and embedding vectors), one mind per session |
+| `MIND_BACKGROUND_FOLD` | `1` | fold + consolidate after the reply (next request awaits an in-flight pass); `0` folds on the request path |
+| `MIND_WORKSPACE_CAP` | `16000` | ceiling on the assembled workspace (estimated tokens) whatever the window |
+| `MIND_MEMORY_FRACTION` / `_MIN_TOKENS` / `_MAX_TOKENS` | `0.35` / `900` / `4000` | the memory section's budget |
+| `MIND_STEWARD_JSON_SCHEMA` | `1` | ask the backend for schema-constrained steward output (auto-disabled if refused) |
+| `MIND_METRICS_PATH` | unset | JSONL telemetry: per-request sizes, per-fold outcomes |
+| `PROVIDER_RETRIES` | `0` | retry transient upstream errors on non-streaming calls |
+| `LMSTUDIO_EXTRA_BODY` / `OPENROUTER_EXTRA_BODY` | `{}` | JSON merged under every request to that provider (the client's own fields win). `{"reasoning_effort":"none"}` is what switches thinking off for LM Studio API calls — the UI toggle does not; OpenRouter takes `{"reasoning":{"enabled":false}}` |
 
 ```bash
 pytest tests/   # unit tests: perception, store invariants, assembler, dynamics, recall, router

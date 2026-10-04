@@ -20,7 +20,7 @@ from pathlib import Path
 from .harness import ChatClient, CodexJudge, render_report
 from .harness.checks import evaluate_check
 from .harness.runner import ScenarioResult, TurnRecord
-from .scenarios import ALL_SCENARIOS
+from .scenarios import ALL_SCENARIOS, OPT_IN_SCENARIOS
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,6 +57,11 @@ async def main() -> None:
     run_dir = Path(args.results_dir)
     stored = json.loads((run_dir / "results.json").read_text(encoding="utf-8"))
     scenarios_by_id = {scenario.id: scenario for scenario in ALL_SCENARIOS}
+    # Opt-in scenarios (the soak) are built lazily, only when the run has them.
+    for stored_scenario in stored["scenarios"]:
+        builder = OPT_IN_SCENARIOS.get(stored_scenario["scenario_id"])
+        if builder is not None:
+            scenarios_by_id[stored_scenario["scenario_id"]] = builder()
 
     judge = None
     if args.judge_codex:

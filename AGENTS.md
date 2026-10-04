@@ -1,18 +1,19 @@
-# Agent Guidelines for Project-2501
+# Agent Guidelines for ghost-in-the-proxy
 
 ## Build/Run/Test
-- **Run dev server**: `PYTHONPATH=. uvicorn server.main:app --reload --host 0.0.0.0 --port 8000` (from project root)
+- **Run dev server**: `uvicorn server.main:app --reload --port 8000` (from project root; config comes from `ghost.env`, local overrides from `.env`)
 - **Run with Docker**: `docker-compose up --build` (from project root)
-- **No test suite configured yet** - follow FastAPI/pytest patterns if adding tests
+- **Tests**: `pytest tests/` (conda env `ghost`); long-conversation soak: `python -m evals.run --scenario s14-soak` + `python -m evals.soak_report`
 
 ## Project Structure
 ```
-Project-2501/
+ghost-in-the-proxy/
 ├── server/              # Backend API
 │   ├── main.py         # Entry point
 │   ├── endpoints/      # Route handlers
 │   ├── routing/        # Provider routing logic
-│   └── providers/      # Provider implementations
+│   ├── providers/      # Provider implementations
+│   └── mind/           # Cognitive middleware (docs/architecture.md, docs/memory-v6.md)
 └── client/             # (Future) Frontend
 ```
 
@@ -23,7 +24,7 @@ Project-2501/
 - **Types**: Use Pydantic models for all request/response schemas; type hint all function signatures
 - **Naming**: snake_case for functions/variables, PascalCase for classes, UPPERCASE for constants/globals
 - **Error handling**: Use FastAPI `HTTPException` with status codes; let httpx errors propagate with `raise_for_status()`
-- **Config**: All env vars loaded via `pydantic.BaseModel` in `config.py`; use `settings` singleton
+- **Config**: `ghost.env` (committed defaults) < `.env` (local) < shell env, loaded by `server/env.py`; env vars surface via `pydantic.BaseModel` in `config.py` / `mind/config.py`. Tests set `GHOST_NO_CONFIG=1`.
 - **Providers**: New providers extend `OpenAILikeProvider` pattern; register in `routing/router.py:PROVIDERS`
 - **Streaming**: Use `AsyncIterator[bytes]` for SSE; pass raw chunks through without parsing
 - **Models**: Support model mapping via `MODEL_MAP` env var (format: `{"alias":"provider:actual_model"}`)

@@ -134,3 +134,13 @@ API level.
   the pattern list in the scenario rather than trusting the number.
 - One run is one sample. Temperature is 0.2 by default; for decisions, run
   scenarios a few times before believing a delta.
+
+
+## Config file and eval runs
+
+The server reads `ghost.env` by default (LM Studio, mind on, `MIND_FAIL_MODE=open`).
+Eval runs should export what they need explicitly — the shell wins — and
+always `MIND_FAIL_MODE=strict` plus a scratch `MIND_DB_DIR`, e.g.
+
+    MIND_FAIL_MODE=strict MIND_FAKE_CLOCK=1 MIND_DB_DIR=/tmp/minds-eval \
+      MIND_METRICS_PATH=/tmp/mind-metrics.jsonl uvicorn server.main:app --port 8000

@@ -12,6 +12,7 @@ compares it against each session's live events and classifies the request:
 One mechanism, per docs/architecture.md decisions 3 and 5.
 """
 
+import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any
@@ -67,16 +68,23 @@ def _score_match(events: list[Event], incoming: list[dict[str, Any]]) -> tuple[i
     return matched, last_kind
 
 
-def reconcile(
-    store: MindStore, messages: list[dict[str, Any]], now: float | None = None
-) -> Reconciliation:
-    """`now` stamps ingested events with an explicit wall-clock time (fake-clock
-    eval runs); None lets the store default to the real clock."""
+def resolve_session(store: MindStore, messages: list[dict[str, Any]]) -> str | None:
+    """Which existing session this transcript belongs to — WITHOUT mutating
+    anything. The runtime uses it to take the session's lock BEFORE
+    reconciling: reconciling first let two queued requests both mutate the
+    store, and the first one through then answered the second one's message."""
     client_system, incoming = _split_system(messages)
+    best = _best_match(store, client_system, incoming)
+    return best[2] if best is not None else None
 
+
+def _best_match(
+    store: MindStore, client_system: str | None, incoming: list[dict[str, Any]]
+) -> tuple[int, str, str, list[Event]] | None:
+    anchor = _anchor(incoming)
     best: tuple[int, str, str, list[Event]] | None = None  # matched, kind, session, events
     best_key = (0, False)
-    for session_id in store.list_session_ids():
+    for session_id in store.list_session_ids(anchor):
         events = store.live_events(session_id)
         if not events:
             continue
@@ -103,6 +111,17 @@ def reconcile(
         if key > best_key:
             best = (matched, kind, session_id, events)
             best_key = key
+    return best
+
+
+def reconcile(
+    store: MindStore, messages: list[dict[str, Any]], now: float | None = None
+) -> Reconciliation:
+    """`now` stamps ingested events with an explicit wall-clock time (fake-clock
+    eval runs); None lets the store default to the real clock."""
+    client_system, incoming = _split_system(messages)
+    anchor = _anchor(incoming)
+    best = _best_match(store, client_system, incoming)
 
     # A session continues only if every incoming message up to the stored
     # history matched (no divergence inside the shared span). Divergence with
@@ -163,9 +182,18 @@ def reconcile(
             store.set_client_system(session_id, client_system)
             return Reconciliation(session_id, "fork", tail)
 
-    session_id = store.create_session(client_system)
+    session_id = store.create_session(client_system, anchor)
     _ingest(store, session_id, incoming, now)
     return Reconciliation(session_id, "new", incoming)
+
+
+def _anchor(incoming: list[dict[str, Any]]) -> str | None:
+    """Hash of the transcript's opening message: the resolver's index key."""
+    if not incoming or incoming[0].get("role") != "user":
+        # An assistant-opening transcript can match by TRUNCATION (the client
+        # kept a prefix of the greeting), which an exact hash would exclude.
+        return None
+    return hashlib.sha1(normalize_message(incoming[0]).encode("utf-8")).hexdigest()
 
 
 def _ingest(

@@ -1,15 +1,19 @@
 """Mind runtime: per-request orchestration, fail-mode policy, reply observation.
 
-Flow per request (docs/architecture.md):
-  reconcile (session + new events) -> maybe summarize -> assemble workspace.
-After the provider responds, the reply is recorded as a provisional event;
-the next request's reconciliation confirms what the client retained.
+Flow per request (docs/architecture.md, docs/memory-v6.md):
+  reconcile (session + new events) -> wait for in-flight maintenance ->
+  build the scene (ledger replay, attention, bounded memory, texture) ->
+  [only if truth would otherwise leave view uncovered: fold now] -> forward.
+After the provider responds, the reply is recorded as a provisional event and
+a background maintenance pass folds and consolidates — the idle loop. The
+next request's reconciliation confirms what the client retained.
 
 MIND_FAIL_MODE=open   -> any mind error falls back to passthrough (production)
 MIND_FAIL_MODE=strict -> mind errors raise; eval runs MUST use strict, or a
                          crashed mind gets silently graded as the passthrough.
 """
 
+import asyncio
 import json
 import re
 import time
@@ -22,16 +26,20 @@ from typing import Any
 # desync reconciliation every turn).
 THINK_BLOCK = re.compile(r"<think>.*?</think>\s*", flags=re.DOTALL)
 
-from .assembler import ThreadsView, Workspace, assemble, estimate_tokens
+from .assembler import DEFAULT_TOKEN_SCALE, Workspace, assemble, estimate_tokens, token_budgets
 from .config import MindConfig, mind_config
+from .consolidate import consolidate_once
 from .dynamics import ThreadState, admitted_threads, cued_threads, update_dynamics
-from .perception import reconcile
+from .ledger import LedgerState, replay
 from .mem import MemQuery, create_mem_backend
+from .memory_view import ThreadsView, memory_budget, render_memory, render_memory_parts
+from .metrics import emit
+from .perception import reconcile, resolve_session
 from .recall import RECALL_TOOL, resolve_recall
 from .router import scope_tools
-from .steward import run_steward
-from .store import MindStore, content_text
-from .summarizer import update_summary
+from .steward import FoldOutcome, run_steward
+from .thoughts import SHEET, ThoughtTrace, think
+from .store import Event, MindStore, content_text
 
 
 @dataclass
@@ -46,6 +54,36 @@ class PreparedRequest:
     # Whether the recall tool is in `tools` this request — the streaming
     # path needs to know before the first chunk whether to hold-and-decide.
     recall_offered: bool = False
+    # What the mind estimated for the whole request (workspace + tool
+    # schemas) — paired with the backend's usage to calibrate the estimate.
+    estimated_tokens: int = 0
+    # Characters of recall payload the request can still absorb, across all
+    # hops, before the follow-up would overflow the window.
+    recall_budget_chars: int = 0
+
+
+@dataclass
+class _Scene:
+    session_id: str
+    workspace: Workspace
+    state: LedgerState
+    threads: ThreadsView | None
+    autocued: int
+    # Commitments whose trigger nudge THIS scene carries; committed to the
+    # session only for the scene that is actually sent.
+    nudged: frozenset = frozenset()
+    thoughts: ThoughtTrace | None = None
+
+
+@dataclass
+class _SessionContext:
+    """What the background pass needs from the request that preceded it."""
+
+    provider: Any
+    model: str
+    clock: float | None
+    tools_tokens: int
+    memory_text: str
 
 
 class MindRuntime:
@@ -57,9 +95,32 @@ class MindRuntime:
         # Per-session observe watermark: events enter Mem at the same moment
         # reconciliation confirms them as conversation truth. After a fork,
         # the rewritten tail gets fresh seqs above the watermark, so it is
-        # re-observed; stale spans in stateful backends are superseded
-        # territory (a future boundary reason), not v0's problem.
+        # re-observed.
         self._mem_seen: dict[str, int] = {}
+        # One lock per session serializes REQUESTS (reconcile + scene). The
+        # background pass does not hold it: a request waits for an in-flight
+        # pass only up to maintenance_wait_s, then proceeds on committed
+        # state — folds commit atomically and refuse stale or overlapping
+        # spans, so racing a pass is safe; hanging behind one is not.
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._context: dict[str, _SessionContext] = {}
+        self._background: set[asyncio.Task] = set()
+        self._maintaining: dict[str, asyncio.Task] = {}
+        # Previous outgoing request per session, serialized: the shared prefix
+        # with the next one is what a backend's KV cache could reuse.
+        self._last_request: dict[str, str] = {}
+        # Phase A: the stable memory text per session, pinned to the ledger
+        # revision; and which commitments already got their trigger nudge.
+        self._stable_cache: dict[str, dict[str, Any]] = {}
+        self._nudged: dict[str, set[str]] = {}
+        # Real tokens per estimated token, learned from usage.prompt_tokens.
+        # Keyed by MODEL: it is a property of the tokenizer, not the session.
+        self._scale: dict[str, float] = {}
+
+    def _lock(self, session_id: str) -> asyncio.Lock:
+        return self._locks.setdefault(session_id, asyncio.Lock())
+
+    # -- request path -----------------------------------------------------------
 
     async def prepare(
         self,
@@ -71,87 +132,95 @@ class MindRuntime:
     ) -> PreparedRequest:
         """`now` is a client-supplied clock (X-Mind-Clock, fake-clock eval runs
         only); None means the real wall clock."""
-        recon = reconcile(self.store, messages, now=now)
         # Chronos (v4): the time the mind renders and reasons with. None keeps
-        # every time-aware surface (Now section, gap markers, due status,
-        # steward timestamps) inert.
+        # every time-aware surface inert.
         clock = (now if now is not None else time.time()) if self.config.time_enabled else None
-        events = self.store.live_events(recon.session_id)
-        seen = self._mem_seen.get(recon.session_id, 0)
+        # Lock FIRST, reconcile under it: reconciliation mutates the store,
+        # and a request that mutates and then queues behind maintenance can
+        # wake up to another request's events.
+        waited = time.monotonic()
+        held = self._lock(resolve_session(self.store, messages) or "__new__")
+        await held.acquire()
+        try:
+            waited = time.monotonic() - waited
+            recon = reconcile(self.store, messages, now=now)
+            session_id = recon.session_id
+            own = self._lock(session_id)
+            if own is not held:
+                # New session (or the match changed while we queued). A fresh
+                # lock acquires without suspending, so nothing can slip in.
+                if own.locked():
+                    held.release()
+                    held = None
+                    await own.acquire()
+                    held = own
+                else:
+                    await own.acquire()
+                    held.release()
+                    held = own
+            return await self._prepare_locked(recon, provider, model, tools, clock, waited)
+        finally:
+            if held is not None:
+                held.release()
+
+    async def _prepare_locked(
+        self,
+        recon: Any,
+        provider: Any,
+        model: str,
+        tools: list[dict[str, Any]] | None,
+        clock: float | None,
+        waited: float,
+    ) -> PreparedRequest:
+        session_id = recon.session_id
+        waited += await self._await_maintenance(session_id)
+        events = self.store.live_events(session_id)
+        seen = self._mem_seen.get(session_id, 0)
         for event in events:
             if event.seq > seen:
-                await self.mem.observe(recon.session_id, event)
+                await self.mem.observe(session_id, event)
         if events:
-            self._mem_seen[recon.session_id] = events[-1].seq
-        client_system = self.store.get_client_system(recon.session_id)
-        summary = self.store.latest_summary(recon.session_id)
-        records = self.store.live_records(recon.session_id)
-        episodes = self.store.live_episodes(recon.session_id)
+            self._mem_seen[session_id] = events[-1].seq
 
-        threads = self._attention(recon.session_id, events, records)
-        recalled = await self._autocue(recon.session_id, events, summary)
-        workspace = assemble(
-            self.config, client_system, events, summary, records, episodes, threads, now=clock,
-            recalled_spans=recalled,
-        )
-        uncovered = self._uncovered_tokens(events, summary, workspace)
-        if uncovered > self.config.summary_trigger_tokens:
-            # Fold everything the budget wants evicted — plus a fold-ahead
-            # margin so the trigger doesn't re-fire every turn — into the
-            # structured ledger (steward), falling back to the v0 prose
-            # summarizer if the steward's proposal doesn't parse.
-            upto = self._fold_boundary(events, workspace.desired_from_seq - 1)
-            try:
-                await run_steward(
-                    self.config, self.store, recon.session_id, events, provider, model, upto,
-                    now=clock,
-                )
-            except Exception as error:
-                print(f"[mind] steward failed ({error!r}); prose fallback", flush=True)
-                await update_summary(
-                    self.config, self.store, recon.session_id, events, provider, model, upto
-                )
-            summary = self.store.latest_summary(recon.session_id)
-            records = self.store.live_records(recon.session_id)
-            episodes = self.store.live_episodes(recon.session_id)
-            threads = self._attention(recon.session_id, events, records)
-            recalled = await self._autocue(recon.session_id, events, summary)
-            workspace = assemble(
-                self.config, client_system, events, summary, records, episodes, threads, now=clock,
-                recalled_spans=recalled,
-            )
-            # A fold is an episode boundary: everything up to the watermark
-            # left verbatim view. (Thread-dormancy transitions are a future,
-            # finer-grained boundary signal.)
-            await self.mem.boundary(recon.session_id, "fold", upto)
-
-        # v3 routing: scope the client's tool pack to this turn, and offer
-        # recall once anything has folded out of verbatim view.
-        last_user_text = next(
-            (
-                text
-                for event in reversed(events)
-                if event.role == "user" and (text := content_text(event.message))
-            ),
-            "",
-        )
+        # v3 routing first: tool schemas ride in the same request, so
+        # their cost has to be known before the workspace is budgeted.
+        last_user_text = _last_user_text(events)
         scoped = tools
         tools_scoped = False
         if self.config.tool_router_enabled and tools:
             scoped = scope_tools(tools, events, last_user_text)
             tools_scoped = scoped is not tools
         out_tools = list(scoped) if scoped else []
-        folded_upto = (summary or (0, ""))[0]
-        recall_offered = self.config.recall_enabled and folded_upto > 0
+
+        scene = await self._scene(session_id, events, clock, out_tools, model, provider, bool(tools))
+        folded = False
+        if self._must_fold_now(events, scene):
+            # Truth is about to leave view with nothing covering it (first
+            # contact with a long transcript, a restart, folding fell
+            # behind): bounded synchronous catch-up, then rebuild.
+            upto = self._fold_boundary(events, scene.workspace.desired_from_seq - 1)
+            await self._fold(session_id, events, provider, model, upto, clock, "request")
+            scene = await self._scene(session_id, events, clock, out_tools, model, provider, bool(tools))
+            folded = True
+
+        self._nudged.setdefault(session_id, set()).update(scene.nudged)
+        # Offer recall once anything has folded out of verbatim view.
+        recall_offered = self.config.recall_enabled and scene.state.covered_upto > 0
         if recall_offered:
             out_tools = out_tools + [RECALL_TOOL]
             tools_scoped = True
+        tools_tokens = estimate_tokens(out_tools) if out_tools else 0
+        self._context[session_id] = _SessionContext(
+            provider, model, clock, tools_tokens, _memory_text(scene.workspace)
+        )
 
+        workspace, state, threads = scene.workspace, scene.state, scene.threads
+        ledger_counts = {kind: len(items) for kind, items in state.grouped().items()}
         print(
             "[mind]",
             json.dumps(
                 {
-                    "session": recon.session_id,
+                    "session": session_id,
                     "outcome": recon.outcome,
                     "tools": {
                         "client": len(tools or []),
@@ -160,17 +229,18 @@ class MindRuntime:
                     },
                     "live_events": len(events),
                     "workspace_tokens_est": workspace.estimated_tokens,
+                    "memory_tokens_est": workspace.memory_tokens,
                     "texture_from_seq": workspace.texture_from_seq,
-                    "summary_upto": (summary or (0, ""))[0],
-                    "ledger": {kind: len(items) for kind, items in records.items()},
-                    "episodes": len(episodes),
+                    "covered_upto": state.covered_upto,
+                    "ledger": ledger_counts,
+                    "episodes": len(state.episodes),
                     "threads": {
                         "total": len(threads.all_keys),
                         "admitted": [
-                            (thread.key, round(thread.activation, 2))
+                            (thread.name, round(thread.activation, 2))
                             for thread in threads.admitted
                         ],
-                        "cued": [thread.key for thread in threads.cued],
+                        "cued": [thread.name for thread in threads.cued],
                     }
                     if threads
                     else None,
@@ -178,61 +248,330 @@ class MindRuntime:
             ),
             flush=True,
         )
+        serialized = json.dumps(workspace.messages, ensure_ascii=False)
+        previous = self._last_request.get(session_id, "")
+        shared = 0
+        for left, right in zip(previous, serialized):
+            if left != right:
+                break
+            shared += 1
+        self._last_request[session_id] = serialized
+        emit(
+            "request",
+            session=session_id,
+            outcome=recon.outcome,
+            request_chars=len(serialized),
+            # Share of THIS request already seen as a prefix of the last one —
+            # an upper bound on KV-cache reuse (0 on the first turn).
+            prefix_reuse=round(shared / len(serialized), 3) if serialized else 0.0,
+            live_events=len(events),
+            workspace_tokens=workspace.estimated_tokens,
+            memory_tokens=workspace.memory_tokens,
+            system_tokens=workspace.system_tokens,
+            budget_tokens=workspace.budget_tokens,
+            tools_tokens=tools_tokens,
+            token_scale=round(self._scale.get(model, DEFAULT_TOKEN_SCALE), 3),
+            texture_messages=len(workspace.messages) - (1 if workspace.system_tokens else 0),
+            texture_from_seq=workspace.texture_from_seq,
+            summary_upto=state.covered_upto,
+            evicted_uncovered=workspace.evicted_uncovered,
+            ledger=ledger_counts,
+            episodes=len(state.episodes),
+            consolidations=len(self.store.live_consolidations(session_id)),
+            autocue=scene.autocued,
+            thoughts=(
+                {
+                    "modes": scene.thoughts.modes, "lines": scene.thoughts.lines,
+                    "calls": scene.thoughts.calls, "seconds": scene.thoughts.seconds,
+                    **scene.thoughts.detail,
+                }
+                if scene.thoughts
+                else None
+            ),
+            folded_on_request=folded,
+            waited_for_maintenance_s=round(waited, 2),
+        )
         return PreparedRequest(
-            recon.session_id,
+            session_id,
             recon.outcome,
             workspace.messages,
             tools=out_tools if tools_scoped else None,
             tools_scoped=tools_scoped,
             recall_offered=recall_offered,
-        )
-
-    async def resolve_recall(self, session_id: str, arguments_json: str) -> str:
-        events = self.store.live_events(session_id)
-        # The trajectory stub: recent verbatim context as the episodic cue
-        # (single moments are ambiguous — holographic experiment #5).
-        return await resolve_recall(
-            events,
-            arguments_json,
-            backend=self.mem,
-            session_id=session_id,
-            trajectory=events[-8:],
-        )
-
-    async def _autocue(self, session_id: str, events: list, summary) -> list | None:
-        """Per-turn semantic rescue (s13: models do not reliably CALL recall).
-
-        Only for backends that opt in, only over FOLDED material (verbatim
-        texture needs no rescuing), and only spans with a real semantic
-        component — lexical reach already has the cue and recall channels,
-        double-serving it would just spend budget.
-        """
-        if not getattr(self.mem, "autocue", False):
-            return None
-        folded_upto = (summary or (0, ""))[0]
-        if folded_upto <= 0:
-            return None
-        last_user = next(
-            (
-                text
-                for event in reversed(events)
-                if event.role == "user" and (text := content_text(event.message))
+            estimated_tokens=workspace.estimated_tokens + tools_tokens,
+            recall_budget_chars=self._recall_headroom(
+                workspace.estimated_tokens + tools_tokens, model
             ),
-            "",
         )
-        if not last_user:
-            return None
-        spans = await self.mem.query(
-            session_id,
-            MemQuery(text=last_user, trajectory=events[-8:], k=4),
-            events,
+
+    async def _scene(
+        self,
+        session_id: str,
+        events: list[Event],
+        clock: float | None,
+        out_tools: list[dict[str, Any]],
+        model: str = "",
+        provider: Any = None,
+        client_has_tools: bool = False,
+    ) -> _Scene:
+        """Everything the model will see, built from current store state."""
+        state = replay(self.store.live_folds(session_id))
+        consolidations = self.store.live_consolidations(session_id)
+        threads = self._attention(session_id, events, state)
+        recalled = await self._autocue(session_id, events, state.covered_upto)
+        # +1 tool: recall joins the belt once anything is folded.
+        tools_tokens = estimate_tokens(out_tools + [RECALL_TOOL]) if (out_tools or state.covered_upto) else 0
+        scale = self._scale.get(model, DEFAULT_TOKEN_SCALE)
+        budget, _hard = token_budgets(self.config, tools_tokens, scale)
+        render_args = dict(
+            cue=_last_user_text(events),
+            mem=self.mem,
+            budget_tokens=memory_budget(self.config, budget),
+            now=clock,
+            recalled_spans=recalled,
+            seq_ts={event.seq: event.ts for event in events if event.ts},
         )
-        rescued = [
-            span
-            for span in spans
-            if span.seq <= folded_upto and span.sim >= self.config.embed_min_sim
-        ]
-        return rescued[:2] or None
+        volatile_text = ""
+        nudged_before = self._nudged.get(session_id, set())
+        nudged_trial = set(nudged_before)
+        if self.config.memory_placement == "split":
+            folds = self.store.live_folds(session_id)
+            parts = await render_memory_parts(
+                self.config, state, consolidations, threads, **render_args,
+                stable_cache=self._stable_cache.setdefault(session_id, {}),
+                revision=(
+                    len(folds), folds[-1]["seq"] if folds else 0,
+                    len(consolidations), consolidations[-1]["seq"] if consolidations else 0,
+                ),
+                already_nudged=nudged_trial,
+                recent_replies=[
+                    text
+                    for event in events[-24:]
+                    if event.role == "assistant" and (text := content_text(event.message))
+                ],
+            )
+            memory_text, volatile_text = parts.stable, parts.volatile
+        else:
+            memory_text = await render_memory(
+                self.config, state, consolidations, threads, **render_args
+            )
+        modes = [mode.strip() for mode in self.config.thoughts.split(",") if mode.strip()]
+        if not self.config.style_nudge:
+            modes = [mode for mode in modes if mode != "rhythm"]
+        if client_has_tools:
+            # A client that sends a tool belt is an agent harness (a coding
+            # assistant, an MCP client), not a chat between friends: "say
+            # less, no lists, tease a little" would be sabotage there.
+            modes = []
+        if "sheet" in modes:
+            memory_text = f"{memory_text}\n\n{SHEET}" if memory_text else SHEET
+
+        def build(volatile: str) -> Workspace:
+            return assemble(
+                self.config,
+                self.store.get_client_system(session_id),
+                events,
+                covered_upto=state.covered_upto,
+                memory_text=memory_text,
+                now=clock,
+                tools_tokens=tools_tokens,
+                scale=scale,
+                volatile_text=volatile,
+                memory_budget_tokens=render_args["budget_tokens"],
+                fold_boundaries=boundaries,
+            )
+
+        boundaries = (
+            [fold["span_to"] for fold in self.store.live_folds(session_id)]
+            if self.config.memory_placement == "split"
+            else None
+        )
+        trace = None
+        if modes and self.config.memory_placement == "split" and events and events[-1].role == "user":
+            # Quick thoughts: model-backed designs ask their private question
+            # over the SAME assembled prefix the reply will use (cache hit),
+            # then the lines join the per-turn notes.
+            trace = await think(
+                [mode for mode in modes if mode != "sheet"],
+                provider,
+                model,
+                build(volatile_text).messages,
+                [t for e in events if e.role == "user" and (t := content_text(e.message))],
+                [t for e in events if e.role == "assistant" and (t := content_text(e.message))],
+            )
+            if trace.lines:
+                volatile_text = _with_thoughts(volatile_text, trace.lines)
+        workspace = build(volatile_text)
+        return _Scene(
+            session_id, workspace, state, threads, len(recalled or []),
+            nudged=frozenset(nudged_trial - nudged_before),
+            thoughts=trace,
+        )
+
+    async def _await_maintenance(self, session_id: str) -> float:
+        task = self._maintaining.get(session_id)
+        if task is None or task.done():
+            return 0.0
+        started = time.monotonic()
+        await asyncio.wait({task}, timeout=self.config.maintenance_wait_s)
+        waited = time.monotonic() - started
+        if not task.done():
+            print(
+                f"[mind] maintenance still running after {waited:.0f}s; proceeding without it",
+                flush=True,
+            )
+        return waited
+
+    def _must_fold_now(self, events: list[Event], scene: _Scene) -> bool:
+        running = self._maintaining.get(scene.session_id)
+        if running is not None and not running.done():
+            return False  # a pass is already folding; never run two stewards
+        if scene.workspace.evicted_uncovered > 0:
+            return True
+        if self.config.background_fold:
+            return False
+        return self._uncovered_tokens(events, scene) > self.config.summary_trigger_tokens
+
+    # -- maintenance (the idle loop) ----------------------------------------------
+
+    def schedule_maintenance(self, session_id: str) -> None:
+        """Fold and consolidate after the reply went out. Fire-and-forget: the
+        session lock makes the next request wait for it, nothing else does."""
+        if not self.config.background_fold or session_id not in self._context:
+            return
+        running = self._maintaining.get(session_id)
+        if running is not None and not running.done():
+            return  # one pass per session at a time; the next reply reschedules
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # sync caller (unit tests): maintenance runs on the request path
+        task = loop.create_task(self._maintain(session_id))
+        self._maintaining[session_id] = task
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    async def _maintain(self, session_id: str) -> None:
+        context = self._context[session_id]
+        try:
+            events = self.store.live_events(session_id)
+            state = replay(self.store.live_folds(session_id))
+            scale = self._scale.get(context.model, DEFAULT_TOKEN_SCALE)
+            workspace = assemble(
+                self.config,
+                self.store.get_client_system(session_id),
+                events,
+                covered_upto=state.covered_upto,
+                memory_text=context.memory_text,
+                now=context.clock,
+                tools_tokens=context.tools_tokens,
+                scale=scale,
+                # Same reserve as the request path — THIS is where fold
+                # pressure is measured, so this is where it has to count.
+                memory_budget_tokens=memory_budget(
+                    self.config, token_budgets(self.config, context.tools_tokens, scale)[0]
+                ),
+            )
+            scene = _Scene(session_id, workspace, state, None, 0)
+            if self._uncovered_tokens(events, scene) > self.config.summary_trigger_tokens:
+                upto = self._fold_boundary(events, workspace.desired_from_seq - 1)
+                await self._fold(
+                    session_id, events, context.provider, context.model, upto,
+                    context.clock, "background",
+                )
+            started = time.monotonic()
+            level = await consolidate_once(
+                self.config, self.store, session_id, context.provider, context.model
+            )
+            if level:
+                emit(
+                    "consolidation", session=session_id, level=level,
+                    seconds=round(time.monotonic() - started, 2),
+                )
+        except Exception as error:
+            # Maintenance is best-effort by design: the request path catches
+            # up synchronously if it ever has to.
+            print(f"[mind] maintenance failed ({error!r})", flush=True)
+            emit("maintenance_error", session=session_id, error=repr(error)[:300])
+
+    def _extraction_target(self, provider: Any, model: str) -> tuple[Any, str]:
+        """Who runs steward/consolidation calls. Default: the conversation's
+        own provider and model. MIND_EXTRACTION_MODEL may name another model
+        on the same provider, a MODEL_MAP alias, or "provider:model" — a
+        DIFFERENT backend matters on a single-slot local server (LM Studio),
+        where a background fold otherwise queues ahead of the user's next
+        message and evicts the conversation's KV cache (measured live: 45-85 s
+        stalls)."""
+        target = self.config.extraction_model
+        if not target:
+            return provider, model
+        from ..routing.router import PROVIDERS, resolve_provider_and_model
+        from ..config import settings
+
+        name, _, rest = target.partition(":")
+        if rest and name in PROVIDERS:
+            return PROVIDERS[name], rest
+        if target in settings.model_map:
+            mapped_provider, mapped_model = resolve_provider_and_model(target)
+            if mapped_provider is not None:
+                return mapped_provider, mapped_model
+        return provider, target
+
+    async def drain(self) -> None:
+        """Wait for background maintenance (tests, graceful shutdown)."""
+        while self._background:
+            await asyncio.gather(*list(self._background), return_exceptions=True)
+
+    async def _fold(
+        self,
+        session_id: str,
+        events: list[Event],
+        provider: Any,
+        model: str,
+        upto: int,
+        clock: float | None,
+        path: str,
+    ) -> None:
+        started = time.monotonic()
+        before = replay(self.store.live_folds(session_id))
+        outcome = FoldOutcome()
+        error_text = ""
+        provider, model = self._extraction_target(provider, model)
+        try:
+            outcome = await run_steward(
+                self.config, self.store, session_id, events, provider, model, upto,
+                now=clock, mem=self.mem,
+                scale=self._scale.get(model, DEFAULT_TOKEN_SCALE),
+                on_usage=lambda estimated, actual: self.note_usage(model, estimated, actual),
+            )
+        except Exception as error:
+            error_text = repr(error)[:300]
+            print(f"[mind] fold failed ({error!r}); span stays uncovered", flush=True)
+        after = replay(self.store.live_folds(session_id))
+        if after.covered_upto > before.covered_upto:
+            # A fold is an episode boundary: everything up to the watermark
+            # left verbatim view.
+            await self.mem.boundary(session_id, "fold", after.covered_upto)
+        emit(
+            "fold",
+            session=session_id,
+            path=path,
+            upto_seq=upto,
+            covered_upto=after.covered_upto,
+            ok=not error_text and not outcome.prose_fallbacks and not outcome.stale,
+            error=error_text or "; ".join(outcome.errors)[:300],
+            folds=outcome.folds,
+            prose_fallbacks=outcome.prose_fallbacks,
+            stale=outcome.stale,
+            ops_applied=outcome.ops_applied,
+            ops_dropped=outcome.ops_dropped[:20],
+            deduped=outcome.deduped,
+            seconds=round(time.monotonic() - started, 2),
+            ledger_before=len(before.records),
+            ledger_after=len(after.records),
+        )
+
+    # -- reply observation -----------------------------------------------------------
 
     def observe_reply(
         self,
@@ -241,7 +580,8 @@ class MindRuntime:
         complete: bool = True,
         ts: float | None = None,
     ) -> None:
-        """Record our own reply as a provisional event (confirmed next request)."""
+        """Record our own reply as a provisional event (confirmed next request),
+        then let the idle loop run."""
         keep = {
             key: value
             for key, value in message.items()
@@ -252,40 +592,124 @@ class MindRuntime:
         self.store.append_event(
             session_id, keep, source="mind", complete=complete, confirmed=False, ts=ts
         )
+        self.schedule_maintenance(session_id)
+
+    def note_usage(self, model: str, estimated_tokens: int, prompt_tokens: int | None) -> None:
+        """Calibrate the token estimate from what the backend actually counted.
+        chars/4 is wrong by a model- and language-dependent factor; the
+        backend knows the truth, so learn it per model (EMA)."""
+        if not prompt_tokens or estimated_tokens < 200:
+            return
+        # No upper clamp worth the name: a measured density is a fact, and
+        # clamping below it guarantees overflow (code or CJK can run 4-5x).
+        observed = max(0.8, min(prompt_tokens / estimated_tokens, 8.0))
+        previous = self._scale.get(model, DEFAULT_TOKEN_SCALE)
+        # Err high: undercounting overflows the window, overcounting only
+        # wastes a little of it.
+        blended = 0.7 * previous + 0.3 * observed
+        self._scale[model] = max(blended, observed * 0.97)
+
+    def _recall_headroom(self, estimated_tokens: int, model: str) -> int:
+        """Characters of recall payload this request can absorb in total."""
+        scale = self._scale.get(model, DEFAULT_TOKEN_SCALE)
+        reserve = max(int(self.config.window * self.config.reserve_fraction), 1024)
+        # Keep at least a third of the reply reserve for the actual answer.
+        headroom_real = self.config.window - reserve // 3 - int(estimated_tokens * scale)
+        return max(0, int(headroom_real / scale) * 4)
+
+    async def resolve_recall(
+        self, session_id: str, arguments_json: str, char_budget: int | None = None
+    ) -> str:
+        events = self.store.live_events(session_id)
+        # The trajectory stub: recent verbatim context as the episodic cue
+        # (single moments are ambiguous — holographic experiment #5).
+        return await resolve_recall(
+            events,
+            arguments_json,
+            backend=self.mem,
+            session_id=session_id,
+            trajectory=events[-8:],
+            char_budget=min(self.recall_char_budget(), char_budget)
+            if char_budget is not None
+            else self.recall_char_budget(),
+        )
+
+    def recall_char_budget(self) -> int:
+        """Per-hop recall payload: ~8% of the window, within [1200, 12000] chars."""
+        return max(1200, min(int(self.config.window * 0.08) * 4, 12000))
+
+    # -- organs ------------------------------------------------------------------------
+
+    async def _autocue(self, session_id: str, events: list[Event], folded_upto: int) -> list | None:
+        """Per-turn semantic rescue (s13: models do not reliably CALL recall).
+
+        Only for backends that opt in, only over FOLDED material (verbatim
+        texture needs no rescuing), and only spans with a real semantic
+        component — lexical reach already has the cue and recall channels.
+        """
+        if not getattr(self.mem, "autocue", False) or folded_upto <= 0:
+            return None
+        last_user = _last_user_text(events)
+        if not last_user:
+            return None
+        # Rank over the whole history, THEN filter to folded: a top-k taken
+        # first is won by the recent verbatim turns (which resemble the
+        # question most) and the folded spans this exists for never surface.
+        spans = await self.mem.query(
+            session_id,
+            MemQuery(text=last_user, trajectory=events[-8:], k=max(len(events), 4)),
+            events,
+        )
+        folded = [span for span in spans if span.seq <= folded_upto and span.sim > 0]
+        if not folded:
+            return None
+        # The fixed cosine floor was calibrated on a 15-turn scenario; in a
+        # long conversation SOMETHING always clears it (the soak auto-cued on
+        # 133 of 160 turns). A span must also stand out from this query's own
+        # background: mean + 1.5 sd over the folded history.
+        sims = [span.sim for span in folded]
+        mean = sum(sims) / len(sims)
+        spread = (sum((sim - mean) ** 2 for sim in sims) / len(sims)) ** 0.5
+        floor = max(self.config.embed_min_sim, mean + 1.5 * spread)
+        # Rank by the SEMANTIC component (the hybrid score's lexical half
+        # favours long assistant replies sharing common words), and prefer
+        # what the user said: that is where one-off details live.
+        rescued = sorted(
+            (span for span in folded if span.sim >= floor),
+            key=lambda span: span.sim + (0.03 if span.role == "user" else 0.0),
+            reverse=True,
+        )
+        return rescued[:3] or None
 
     def _attention(
-        self,
-        session_id: str,
-        events: list,
-        records: dict[str, list[dict[str, Any]]],
+        self, session_id: str, events: list[Event], state: LedgerState
     ) -> ThreadsView | None:
         """CRS tick (v2): decay/boost thread activations for any user turns
         not yet applied, persist, and compute workspace admission + cues.
 
         Returns None when the steward has proposed no threads yet — the
-        assembler then renders every fact (exactly v1 behavior).
+        renderer then treats every fact as loose (v1 behavior, under budget).
         """
-        structure = self.store.live_threads(session_id)
-        if not structure:
+        if not state.threads:
             return None
         facts_by_thread: dict[str, list[dict[str, Any]]] = {}
-        for fact in records.get("fact", []):
-            facts_by_thread.setdefault(str(fact.get("thread")), []).append(fact)
+        for record in state.by_kind("fact"):
+            facts_by_thread.setdefault(str(record.data.get("thread")), []).append(record.data)
         dynamics = self.store.get_dynamics(session_id)
         states: list[ThreadState] = []
-        for thread in structure:
-            key = thread["key"]
-            state = ThreadState(
-                key=key,
-                kind=str(thread.get("kind", "topic")),
-                summary=str(thread.get("summary", "")),
-                anchors=[str(anchor) for anchor in thread.get("anchors") or []],
-                open_questions=[str(q) for q in thread.get("open_questions") or []],
-                facts=facts_by_thread.get(key, []),
+        for thread in state.threads.values():
+            thread_state = ThreadState(
+                key=thread.id,
+                name=thread.name,
+                kind=str(thread.data.get("kind", "topic")),
+                summary=str(thread.data.get("summary", "")),
+                anchors=[str(anchor) for anchor in thread.data.get("anchors") or []],
+                open_questions=[str(q) for q in thread.data.get("open_questions") or []],
+                facts=facts_by_thread.get(thread.id, []),
             )
-            if key in dynamics:
-                state.activation, state.importance = dynamics[key][0], dynamics[key][1]
-            states.append(state)
+            if thread.id in dynamics:
+                thread_state.activation, thread_state.importance = dynamics[thread.id][:2]
+            states.append(thread_state)
 
         applied_upto = max((row[2] for row in dynamics.values()), default=0)
         last_user_text = ""
@@ -301,18 +725,19 @@ class MindRuntime:
                 ticked_upto = event.seq
             last_user_text = text
         if ticked_upto > applied_upto:
-            for state in states:
+            for thread_state in states:
                 self.store.set_dynamics(
-                    session_id, state.key, state.activation, state.importance, ticked_upto
+                    session_id, thread_state.key, thread_state.activation,
+                    thread_state.importance, ticked_upto,
                 )
 
         admitted = admitted_threads(states)
         cued = cued_threads(states, last_user_text, admitted)
         return ThreadsView(
-            admitted=admitted, cued=cued, all_keys={state.key for state in states}
+            admitted=admitted, cued=cued, all_keys={thread_state.key for thread_state in states}
         )
 
-    def _fold_boundary(self, events, base_upto: int) -> int:
+    def _fold_boundary(self, events: list[Event], base_upto: int) -> int:
         """Extend the fold boundary past what the budget strictly requires.
 
         Walks forward from base_upto accumulating fold_ahead_tokens, landing
@@ -337,14 +762,45 @@ class MindRuntime:
                     break
         return extended
 
-    def _uncovered_tokens(self, events, summary, workspace: Workspace) -> int:
-        """Eviction pressure: tokens the BUDGET wants out but no summary covers."""
-        summary_upto = (summary or (0, ""))[0]
+    def _uncovered_tokens(self, events: list[Event], scene: _Scene) -> int:
+        """Eviction pressure: tokens the BUDGET wants out but no fold covers."""
         return sum(
             estimate_tokens(event.message)
             for event in events
-            if summary_upto < event.seq < workspace.desired_from_seq
+            if scene.state.covered_upto < event.seq < scene.workspace.desired_from_seq
         )
+
+
+def _last_user_text(events: list[Event]) -> str:
+    return next(
+        (
+            text
+            for event in reversed(events)
+            if event.role == "user" and (text := content_text(event.message))
+        ),
+        "",
+    )
+
+
+def _with_thoughts(volatile: str, lines: list[str]) -> str:
+    """Put the quick thoughts LAST in the notes block — nearest the user's
+    words, where a small model attends most."""
+    from .memory_view import NOTES_CLOSE, NOTES_OPEN
+
+    block = (
+        "Before you reply — your own quick read of this moment (act on it, never mention it):\n"
+        + "\n".join(f"- {line}" for line in lines)
+    )
+    if NOTES_CLOSE in volatile:
+        return volatile.replace(NOTES_CLOSE, f"\n{block}\n{NOTES_CLOSE}", 1)
+    head = f"{volatile}\n" if volatile else ""
+    return f"{NOTES_OPEN}\n{head}{block}\n{NOTES_CLOSE}"
+
+
+def _memory_text(workspace: Workspace) -> str:
+    """Stand-in for the memory section when maintenance re-measures pressure:
+    same size as what the request just rendered, without re-rendering it."""
+    return "x" * (workspace.memory_tokens * 4)
 
 
 _runtime: MindRuntime | None = None
