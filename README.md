@@ -41,12 +41,16 @@ python -m evals.run --base-url http://127.0.0.1:8000/v1 --model <model> --label 
 
 ## Running
 
+You need `conda` first — if you don't have it, install [Miniconda](https://www.anaconda.com/docs/getting-started/miniconda/install) or [Anaconda](https://www.anaconda.com/docs/getting-started/anaconda/install) (the [conda install guide](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html) compares them).
+
 ```bash
+conda create -n ghost python=3.11
+conda activate ghost
 pip install -r server/requirements.txt
 uvicorn server.main:app --port 8000
 ```
 
-That is the whole command: [`ghost.env`](ghost.env) is the committed config file, and its defaults start the mind against a local LM Studio (`http://127.0.0.1:1234`, 8k window, bge-m3 embeddings, reasoning off). Edit it, or override per machine in a gitignored `.env` (API keys go there); anything exported in the shell wins over both. `GHOST_CONFIG=path` selects a different file.
+The conda env is a convention, not a requirement — the docs call it `ghost`, and any Python 3.11 environment with `server/requirements.txt` installed works. Past the install, that is the whole command: [`ghost.env`](ghost.env) is the committed config file, and its defaults start the mind against a local LM Studio (`http://127.0.0.1:1234`, 8k window, bge-m3 embeddings, reasoning off). Edit it, or override per machine in a gitignored `.env` (API keys go there); anything exported in the shell wins over both. `GHOST_CONFIG=path` selects a different file.
 
 Point any OpenAI-compatible client at `http://localhost:8000/v1`. With `MIND_ENABLED=0` the server is a faithful passthrough (that bare proxy lives on as its own project: [LLM-passthrough-endpoint](https://github.com/IdentityOverflow/LLM-passthrough-endpoint)).
 
@@ -80,6 +84,7 @@ Key settings (all in `ghost.env`; see `server/mind/config.py` for every knob):
 | `LMSTUDIO_EXTRA_BODY` / `OPENROUTER_EXTRA_BODY` | `{}` | JSON merged under every request to that provider (the client's own fields win). `{"reasoning_effort":"none"}` is what switches thinking off for LM Studio API calls — the UI toggle does not; OpenRouter takes `{"reasoning":{"enabled":false}}` |
 
 ```bash
+conda activate ghost
 pytest tests/   # unit tests: perception, store invariants, assembler, dynamics, recall, router
 ```
 
